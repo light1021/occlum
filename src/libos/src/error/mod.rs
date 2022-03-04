@@ -21,7 +21,7 @@ macro_rules! errno {
             let msg: &'static str = $error_msg;
             (errno, msg)
         };
-        let error = Error::embeded(inner_error, Some(ErrorLocation::new(file!(), line!())));
+        let error = Error::embedded(inner_error, Some(ErrorLocation::new(file!(), line!())));
         error
     }};
     ($error_expr: expr) => {{
@@ -44,8 +44,24 @@ macro_rules! return_errno {
 macro_rules! try_libc {
     ($ret: expr) => {{
         let ret = unsafe { $ret };
-        if ret == -1 {
+        if ret < 0 {
             let errno = unsafe { libc::errno() };
+            return_errno!(Errno::from(errno as u32), "libc error");
+        }
+        ret
+    }};
+}
+
+// return Err(errno) if libc return -1
+// raise SIGPIPE if errno == EPIPE
+macro_rules! try_libc_may_epipe {
+    ($ret: expr) => {{
+        let ret = unsafe { $ret };
+        if ret < 0 {
+            let errno = unsafe { libc::errno() };
+            if errno == Errno::EPIPE as i32 {
+                crate::signal::do_tkill(current!().tid(), crate::signal::SIGPIPE.as_u8() as i32);
+            }
             return_errno!(Errno::from(errno as u32), "libc error");
         }
         ret

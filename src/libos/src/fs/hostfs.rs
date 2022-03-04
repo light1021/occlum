@@ -3,6 +3,7 @@ use alloc::sync::{Arc, Weak};
 use core::any::Any;
 use rcore_fs::vfs::*;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{DirEntryExt, FileTypeExt};
 use std::path::{Path, PathBuf};
 use std::sync::{SgxMutex as Mutex, SgxMutexGuard as MutexGuard};
 use std::untrusted::fs;
@@ -27,7 +28,7 @@ impl FileSystem for HostFS {
         Ok(())
     }
 
-    fn root_inode(&self) -> Arc<INode> {
+    fn root_inode(&self) -> Arc<dyn INode> {
         Arc::new(HNode {
             path: self.path.clone(),
             file: Mutex::new(None),
@@ -36,7 +37,8 @@ impl FileSystem for HostFS {
     }
 
     fn info(&self) -> FsInfo {
-        unimplemented!()
+        warn!("HostFS: FsInfo is unimplemented");
+        Default::default()
     }
 }
 
@@ -90,7 +92,15 @@ impl INode for HNode {
     }
 
     fn poll(&self) -> Result<PollStatus> {
-        unimplemented!()
+        let metadata = try_std!(self.path.metadata());
+        if !metadata.is_file() {
+            return Err(FsError::NotFile);
+        }
+        Ok(PollStatus {
+            read: true,
+            write: !metadata.permissions().readonly(),
+            error: false,
+        })
     }
 
     fn metadata(&self) -> Result<Metadata> {
@@ -104,21 +114,27 @@ impl INode for HNode {
     }
 
     fn sync_all(&self) -> Result<()> {
-        warn!("HostFS: sync_all() is unimplemented");
+        let mut guard = self.open_file()?;
+        let file = guard.as_mut().unwrap();
+        try_std!(file.sync_all());
         Ok(())
     }
 
     fn sync_data(&self) -> Result<()> {
-        warn!("HostFS: sync_data() is unimplemented");
+        let mut guard = self.open_file()?;
+        let file = guard.as_mut().unwrap();
+        try_std!(file.sync_data());
         Ok(())
     }
 
     fn resize(&self, len: usize) -> Result<()> {
-        warn!("HostFS: resize() is unimplemented");
+        let mut guard = self.open_file()?;
+        let file = guard.as_mut().unwrap();
+        try_std!(file.set_len(len as u64));
         Ok(())
     }
 
-    fn create(&self, name: &str, type_: FileType, mode: u32) -> Result<Arc<dyn INode>> {
+    fn create(&self, name: &str, type_: FileType, mode: u16) -> Result<Arc<dyn INode>> {
         let new_path = self.path.join(name);
         if new_path.exists() {
             return Err(FsError::EntryExist);
@@ -127,7 +143,13 @@ impl INode for HNode {
             FileType::File => {
                 try_std!(fs::File::create(&new_path));
             }
-            _ => unimplemented!("only support creating files in HostFS"),
+            FileType::Dir => {
+                try_std!(fs::create_dir(&new_path));
+            }
+            _ => {
+                warn!("only support creating regular file or directory in HostFS");
+                return Err(FsError::PermError);
+            }
         }
         Ok(Arc::new(HNode {
             path: new_path,
@@ -136,7 +158,7 @@ impl INode for HNode {
         }))
     }
 
-    fn link(&self, name: &str, other: &Arc<INode>) -> Result<()> {
+    fn link(&self, name: &str, other: &Arc<dyn INode>) -> Result<()> {
         let other = other.downcast_ref::<Self>().ok_or(FsError::NotSameFs)?;
         try_std!(fs::hard_link(&other.path, &self.path.join(name)));
         Ok(())
@@ -147,19 +169,24 @@ impl INode for HNode {
         if new_path.is_file() {
             try_std!(fs::remove_file(new_path));
         } else if new_path.is_dir() {
-            unimplemented!("no remove_dir in sgx_std?")
-        // fs::remove_dir(new_path)?;
+            try_std!(fs::remove_dir(new_path));
         } else {
             return Err(FsError::EntryNotFound);
         }
         Ok(())
     }
 
-    fn move_(&self, old_name: &str, target: &Arc<INode>, new_name: &str) -> Result<()> {
-        unimplemented!()
+    fn move_(&self, old_name: &str, target: &Arc<dyn INode>, new_name: &str) -> Result<()> {
+        let old_path = self.path.join(old_name);
+        let new_path = {
+            let target = target.downcast_ref::<Self>().ok_or(FsError::NotSameFs)?;
+            target.path.join(new_name)
+        };
+        try_std!(fs::rename(&old_path, &new_path));
+        Ok(())
     }
 
-    fn find(&self, name: &str) -> Result<Arc<INode>> {
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
         let new_path = self.path.join(name);
         if !new_path.exists() {
             return Err(FsError::EntryNotFound);
@@ -175,17 +202,47 @@ impl INode for HNode {
         if !self.path.is_dir() {
             return Err(FsError::NotDir);
         }
-        unimplemented!("no read_dir in sgx_std?")
-        // FIXME: read_dir
+        if let Some(entry) = try_std!(self.path.read_dir()).nth(id) {
+            try_std!(entry)
+                .file_name()
+                .into_string()
+                .map_err(|_| FsError::InvalidParam)
+        } else {
+            return Err(FsError::EntryNotFound);
+        }
+    }
 
-        // self.path
-        //     .read_dir()
-        //     .map_err(|_| FsError::NotDir)?
-        //     .nth(id)
-        //     .map_err(|_| FsError::EntryNotFound)?
-        //     .file_name()
-        //     .into_string()
-        //     .map_err(|_| FsError::InvalidParam)
+    fn iterate_entries(&self, ctx: &mut DirentWriterContext) -> Result<usize> {
+        if !self.path.is_dir() {
+            return Err(FsError::NotDir);
+        }
+        let idx = ctx.pos();
+        let mut total_written_len = 0;
+        for entry in try_std!(self.path.read_dir()).skip(idx) {
+            let entry = try_std!(entry);
+            let written_len = match ctx.write_entry(
+                &entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| FsError::InvalidParam)?,
+                entry.ino(),
+                entry
+                    .file_type()
+                    .map_err(|_| FsError::InvalidParam)?
+                    .into_fs_filetype(),
+            ) {
+                Ok(written_len) => written_len,
+                Err(e) => {
+                    if total_written_len == 0 {
+                        return Err(e);
+                    } else {
+                        break;
+                    }
+                }
+            };
+            total_written_len += written_len;
+        }
+        Ok(total_written_len)
     }
 
     fn io_control(&self, cmd: u32, data: usize) -> Result<()> {
@@ -193,11 +250,11 @@ impl INode for HNode {
         Ok(())
     }
 
-    fn fs(&self) -> Arc<FileSystem> {
+    fn fs(&self) -> Arc<dyn FileSystem> {
         self.fs.clone()
     }
 
-    fn as_any_ref(&self) -> &Any {
+    fn as_any_ref(&self) -> &dyn Any {
         self
     }
 }
@@ -244,13 +301,39 @@ impl IntoFsError for std::io::Error {
     }
 }
 
+trait IntoFsFileType {
+    fn into_fs_filetype(self) -> FileType;
+}
+
+impl IntoFsFileType for fs::FileType {
+    fn into_fs_filetype(self) -> FileType {
+        if self.is_dir() {
+            FileType::Dir
+        } else if self.is_file() {
+            FileType::File
+        } else if self.is_symlink() {
+            FileType::SymLink
+        } else if self.is_block_device() {
+            FileType::BlockDevice
+        } else if self.is_char_device() {
+            FileType::CharDevice
+        } else if self.is_fifo() {
+            FileType::NamedPipe
+        } else if self.is_socket() {
+            FileType::Socket
+        } else {
+            unimplemented!("unknown file type")
+        }
+    }
+}
+
 trait IntoFsMetadata {
     fn into_fs_metadata(self) -> Metadata;
 }
 
 impl IntoFsMetadata for fs::Metadata {
     fn into_fs_metadata(self) -> Metadata {
-        use libc;
+        use sgx_trts::libc;
         use std::os::fs::MetadataExt;
         Metadata {
             dev: self.st_dev() as usize,
@@ -260,15 +343,15 @@ impl IntoFsMetadata for fs::Metadata {
             blocks: self.st_blocks() as usize,
             atime: Timespec {
                 sec: self.st_atime(),
-                nsec: self.st_atime_nsec() as i32,
+                nsec: self.st_atime_nsec(),
             },
             mtime: Timespec {
                 sec: self.st_mtime(),
-                nsec: self.st_mtime_nsec() as i32,
+                nsec: self.st_mtime_nsec(),
             },
             ctime: Timespec {
                 sec: self.st_ctime(),
-                nsec: self.st_ctime_nsec() as i32,
+                nsec: self.st_ctime_nsec(),
             },
             type_: match self.st_mode() & 0xf000 {
                 libc::S_IFCHR => FileType::CharDevice,

@@ -1,10 +1,7 @@
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <fcntl.h>
-#include <unistd.h>
-#include <string.h>
-#include <stdio.h>
-#include "test.h"
+#include "test_fs.h"
 
 // ============================================================================
 // Helper macros
@@ -30,11 +27,11 @@ static int open_file(const char *filename, int flags, int mode) {
     return fd;
 }
 
-static const char* write_msg = "Hello SEFS 1234567890\n";
+static const char *write_msg = "Hello SEFS 1234567890\n";
 
 static int write_file(int fd) {
     int len = strlen(write_msg);
-    if ((len = write(fd, write_msg, len)<= 0)) {
+    if ((len = write(fd, write_msg, len) <= 0)) {
         PRINT_DBG("ERROR: failed to write to the file\n");
         return -1;
     }
@@ -43,7 +40,7 @@ static int write_file(int fd) {
     return 0;
 }
 
-static int read_file(int fd){
+static int read_file(int fd) {
     int len;
     char read_buf[128] = {0};
     if ((len = read(fd, read_buf, sizeof(read_buf) - 1)) <= 0) {
@@ -65,17 +62,19 @@ static int read_file(int fd){
 //      do read or write according to do_write
 //      check the result of the read/write with the given expected_result
 static int do_perm_tests(
-    const char** files,
+    const char **files,
     size_t num_files,
     int flags, int do_write,
-    int* expected_results)
-{
-    flags |= O_CREAT | O_TRUNC;
-    for(size_t i = 0; i < num_files; i++) {
-        const char* filename = files[i];
+    int *expected_results) {
+    flags |= O_CREAT;
+    for (size_t i = 0; i < num_files; i++) {
+        const char *filename = files[i];
         int expected_result = expected_results[i];
 
         int fd = open_file(filename, flags, 0666);
+        if (fd < 0 && fd != expected_result) {
+            return -1;
+        }
         int result = do_write ? write_file(fd) : read_file(fd);
         if (result != expected_result) {
             return -1;
@@ -89,7 +88,7 @@ static int do_perm_tests(
 // ============================================================================
 
 // Test files
-static const char* test_files[NUM_TEST_FILES] = {
+static const char *test_files[NUM_TEST_FILES] = {
     "/test_fs_perms.txt",
     "/bin/test_fs_perms.txt",
     "/lib/test_fs_perms.txt",
@@ -98,49 +97,49 @@ static const char* test_files[NUM_TEST_FILES] = {
 };
 
 // Test cases X Test files -> Test Results
-static int test_expected_results[NUM_TEST_CASES][NUM_TEST_FILES]= {
+static int test_expected_results[NUM_TEST_CASES][NUM_TEST_FILES] = {
     // test_open_ro_then_write()
     {NG, NG, NG, NG, NG},
     // test_open_wo_then_write()
-    {NG, NG, NG, OK, OK},
+    {OK, OK, OK, OK, OK},
     // test_open_rw_then_write()
-    {NG, NG, NG, OK, OK},
+    {OK, OK, OK, OK, OK},
     // test_open_ro_then_read()
-    {NG, NG, NG, OK, OK},
+    {OK, OK, OK, OK, OK},
     // test_open_wo_then_read()
     {NG, NG, NG, NG, NG},
     // test_open_rw_then_read()
-    {NG, NG, NG, OK, OK},
+    {OK, OK, OK, OK, OK},
 };
 
 int test_open_ro_then_write() {
     return do_perm_tests(test_files, NUM_TEST_FILES,
-        O_RDONLY, 1, test_expected_results[0]);
+                         O_RDONLY, 1, test_expected_results[0]);
 }
 
 int test_open_wo_then_write() {
     return do_perm_tests(test_files, NUM_TEST_FILES,
-        O_WRONLY, 1, test_expected_results[1]);
+                         O_WRONLY, 1, test_expected_results[1]);
 }
 
 int test_open_rw_then_write() {
     return do_perm_tests(test_files, NUM_TEST_FILES,
-        O_RDWR, 1, test_expected_results[2]);
+                         O_RDWR, 1, test_expected_results[2]);
 }
 
 int test_open_ro_then_read() {
     return do_perm_tests(test_files, NUM_TEST_FILES,
-        O_RDONLY, 0, test_expected_results[3]);
+                         O_RDONLY, 0, test_expected_results[3]);
 }
 
-int test_open_wo_then_read(){
+int test_open_wo_then_read() {
     return do_perm_tests(test_files, NUM_TEST_FILES,
-        O_WRONLY, 0, test_expected_results[4]);
+                         O_WRONLY, 0, test_expected_results[4]);
 }
 
 int test_open_rw_then_read() {
     return do_perm_tests(test_files, NUM_TEST_FILES,
-        O_RDWR, 0, test_expected_results[5]);
+                         O_RDWR, 0, test_expected_results[5]);
 }
 
 // ============================================================================
@@ -156,6 +155,6 @@ test_case_t test_cases[NUM_TEST_CASES] = {
     TEST_CASE(test_open_rw_then_read)
 };
 
-int main(int argc, const char* argv[]) {
+int main(int argc, const char *argv[]) {
     return test_suite_run(test_cases, NUM_TEST_CASES);
 }

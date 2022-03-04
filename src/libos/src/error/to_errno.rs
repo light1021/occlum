@@ -86,7 +86,7 @@ impl ToErrno for rcore_fs::vfs::FsError {
             FsError::DirRemoved => ENOENT,
             FsError::DirNotEmpty => ENOTEMPTY,
             FsError::WrongFs => EINVAL,
-            FsError::DeviceError => EIO,
+            FsError::DeviceError(err) => EIO,
             FsError::SymLoop => ELOOP,
             FsError::NoDevice => ENXIO,
             FsError::IOCTLError => EINVAL,
@@ -95,6 +95,22 @@ impl ToErrno for rcore_fs::vfs::FsError {
             FsError::WrProtected => EROFS,
             FsError::NoIntegrity => EIO,
             FsError::PermError => EPERM,
+            FsError::NameTooLong => ENAMETOOLONG,
+            FsError::FileTooBig => EFBIG,
+            FsError::OpNotSupported => EOPNOTSUPP,
+            FsError::NotMountPoint => EINVAL,
         }
+    }
+}
+
+impl ToErrno for std::alloc::AllocError {
+    fn errno(&self) -> Errno {
+        ENOMEM
+    }
+}
+
+impl ToErrno for std::alloc::LayoutError {
+    fn errno(&self) -> Errno {
+        EINVAL
     }
 }

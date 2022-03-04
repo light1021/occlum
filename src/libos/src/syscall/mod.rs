@@ -2,335 +2,766 @@
 //!
 //! # Syscall processing flow
 //!
-//! 1. User call `__occlum_syscall` (at `syscall_entry_x86_64.S`)
-//! 2. Do some bound checks then call `dispatch_syscall` (at this file)
-//! 3. Dispatch the syscall to `do_*` (at this file)
-//! 4. Do some memory checks then call `mod::do_*` (at each module)
+//! 1. Libc calls `__occlum_syscall` (in `syscall_entry_x86_64.S`)
+//! 2. Do user/LibOS switch and then call `occlum_syscall` (in this file)
+//! 3. Preprocess the system call and then call `dispatch_syscall` (in this file)
+//! 4. Call `do_*` to process the system call (in other modules)
 
-use fs::*;
-use misc::{resource_t, rlimit_t, utsname_t};
-use process::{pid_t, ChildProcessFilter, CloneFlags, CpuSet, FileAction, FutexFlags, FutexOp};
+use aligned::{Aligned, A16};
+use core::arch::x86_64::{_fxrstor, _fxsave};
+use std::any::Any;
+use std::convert::TryFrom;
+use std::default::Default;
 use std::ffi::{CStr, CString};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::mem::MaybeUninit;
 use std::ptr;
-use time::{clockid_t, timespec_t, timeval_t};
+use time::{clockid_t, itimerspec_t, timespec_t, timeval_t};
+use util::log::{self, LevelFilter};
 use util::mem_util::from_user::*;
-use vm::{MMapFlags, VMPerms};
-use {fs, process, std, vm};
+
+use crate::exception::do_handle_exception;
+use crate::fs::{
+    do_access, do_chdir, do_chmod, do_chown, do_close, do_creat, do_dup, do_dup2, do_dup3,
+    do_eventfd, do_eventfd2, do_faccessat, do_fallocate, do_fchdir, do_fchmod, do_fchmodat,
+    do_fchown, do_fchownat, do_fcntl, do_fdatasync, do_fstat, do_fstatat, do_fstatfs, do_fsync,
+    do_ftruncate, do_getcwd, do_getdents, do_getdents64, do_ioctl, do_lchown, do_link, do_linkat,
+    do_lseek, do_lstat, do_mkdir, do_mkdirat, do_mount, do_mount_rootfs, do_open, do_openat,
+    do_pipe, do_pipe2, do_pread, do_pwrite, do_read, do_readlink, do_readlinkat, do_readv,
+    do_rename, do_renameat, do_rmdir, do_sendfile, do_stat, do_statfs, do_symlink, do_symlinkat,
+    do_sync, do_timerfd_create, do_timerfd_gettime, do_timerfd_settime, do_truncate, do_umask,
+    do_umount, do_unlink, do_unlinkat, do_write, do_writev, iovec_t, AsTimer, File, FileDesc,
+    FileRef, HostStdioFds, Stat, Statfs,
+};
+use crate::interrupt::{do_handle_interrupt, sgx_interrupt_info_t};
+use crate::misc::{resource_t, rlimit_t, sysinfo_t, utsname_t, RandFlags};
+use crate::net::{
+    do_accept, do_accept4, do_bind, do_connect, do_epoll_create, do_epoll_create1, do_epoll_ctl,
+    do_epoll_pwait, do_epoll_wait, do_getpeername, do_getsockname, do_getsockopt, do_listen,
+    do_poll, do_ppoll, do_recvfrom, do_recvmsg, do_select, do_sendmmsg, do_sendmsg, do_sendto,
+    do_setsockopt, do_shutdown, do_socket, do_socketpair, mmsghdr, msghdr, msghdr_mut,
+};
+use crate::process::{
+    do_arch_prctl, do_clone, do_execve, do_exit, do_exit_group, do_futex, do_get_robust_list,
+    do_getegid, do_geteuid, do_getgid, do_getgroups, do_getpgid, do_getpgrp, do_getpid, do_getppid,
+    do_gettid, do_getuid, do_prctl, do_set_robust_list, do_set_tid_address, do_setpgid,
+    do_spawn_for_glibc, do_spawn_for_musl, do_vfork, do_wait4, pid_t, posix_spawnattr_t, FdOp,
+    RobustListHead, SpawnFileActions, ThreadStatus,
+};
+use crate::sched::{do_getcpu, do_sched_getaffinity, do_sched_setaffinity, do_sched_yield};
+use crate::signal::{
+    do_kill, do_rt_sigaction, do_rt_sigpending, do_rt_sigprocmask, do_rt_sigreturn,
+    do_rt_sigtimedwait, do_sigaltstack, do_tgkill, do_tkill, sigaction_t, siginfo_t, sigset_t,
+    stack_t,
+};
+use crate::vm::{MMapFlags, MRemapFlags, MSyncFlags, VMPerms};
+use crate::{fs, process, std, vm};
 
 use super::*;
 
-use self::consts::*;
-use std::any::Any;
-use std::io::{Read, Seek, SeekFrom, Write};
+/// System call table defined in a macro.
+///
+/// To keep the info about system calls in a centralized place and avoid redundant code, the system
+/// call table is defined in this macro. This macro takes as input a callback macro, which
+/// can then process the system call table defined in this macro and generated code accordingly.
+///
+/// # Why callback?
+///
+/// Since the system call table is quite big, we do not want to repeat it more than once in code. But
+/// passing a block of grammarly malformed code (such as the system call table shown below) seems
+/// difficult due to some limitations of Rust macros.
+///
+/// So instead of passing the syscall table to another macro, we do this the other way around: accepting
+/// a macro callback as input, and then internally pass the system call table to the callback.
+macro_rules! process_syscall_table_with_callback {
+    ($callback: ident) => {
+        $callback! {
+            // System call table.
+            //
+            // Format:
+            // (<SyscallName> = <SyscallNum>) => <SyscallFunc>(<SyscallArgs>),
+            //
+            // If the system call is implemented, <SyscallFunc> is the function that implements the system call.
+            // Otherwise, it is set to an proper error handler function.
+            //
+            // Limitation:
+            // <SyscallFunc> must be an identifier, not a path.
+            //
+            // TODO: Unify the use of C types. For example, u8 or i8 or char_c for C string?
+            (Read = 0) => do_read(fd: FileDesc, buf: *mut u8, size: usize),
+            (Write = 1) => do_write(fd: FileDesc, buf: *const u8, size: usize),
+            (Open = 2) => do_open(path: *const i8, flags: u32, mode: u16),
+            (Close = 3) => do_close(fd: FileDesc),
+            (Stat = 4) => do_stat(path: *const i8, stat_buf: *mut Stat),
+            (Fstat = 5) => do_fstat(fd: FileDesc, stat_buf: *mut Stat),
+            (Lstat = 6) => do_lstat(path: *const i8, stat_buf: *mut Stat),
+            (Poll = 7) => do_poll(fds: *mut libc::pollfd, nfds: libc::nfds_t, timeout: c_int),
+            (Lseek = 8) => do_lseek(fd: FileDesc, offset: off_t, whence: i32),
+            (Mmap = 9) => do_mmap(addr: usize, size: usize, perms: i32, flags: i32, fd: FileDesc, offset: off_t),
+            (Mprotect = 10) => do_mprotect(addr: usize, len: usize, prot: u32),
+            (Munmap = 11) => do_munmap(addr: usize, size: usize),
+            (Brk = 12) => do_brk(new_brk_addr: usize),
+            (RtSigaction = 13) => do_rt_sigaction(signum_c: c_int, new_sa_c: *const sigaction_t, old_sa_c: *mut sigaction_t),
+            (RtSigprocmask = 14) => do_rt_sigprocmask(how: c_int, set: *const sigset_t, oldset: *mut sigset_t, sigset_size: size_t),
+            (RtSigreturn = 15) => do_rt_sigreturn(context: *mut CpuContext),
+            (Ioctl = 16) => do_ioctl(fd: FileDesc, cmd: u32, argp: *mut u8),
+            (Pread64 = 17) => do_pread(fd: FileDesc, buf: *mut u8, size: usize, offset: off_t),
+            (Pwrite64 = 18) => do_pwrite(fd: FileDesc, buf: *const u8, size: usize, offset: off_t),
+            (Readv = 19) => do_readv(fd: FileDesc, iov: *mut iovec_t, count: i32),
+            (Writev = 20) => do_writev(fd: FileDesc, iov: *const iovec_t, count: i32),
+            (Access = 21) => do_access(path: *const i8, mode: u32),
+            (Pipe = 22) => do_pipe(fds_u: *mut i32),
+            (Select = 23) => do_select(nfds: c_int, readfds: *mut libc::fd_set, writefds: *mut libc::fd_set, exceptfds: *mut libc::fd_set, timeout: *mut timeval_t),
+            (SchedYield = 24) => do_sched_yield(),
+            (Mremap = 25) => do_mremap(old_addr: usize, old_size: usize, new_size: usize, flags: i32, new_addr: usize),
+            (Msync = 26) => do_msync(addr: usize, size: usize, flags: u32),
+            (Mincore = 27) => handle_unsupported(),
+            (Madvise = 28) => handle_unsupported(),
+            (Shmget = 29) => handle_unsupported(),
+            (Shmat = 30) => handle_unsupported(),
+            (Shmctl = 31) => handle_unsupported(),
+            (Dup = 32) => do_dup(old_fd: FileDesc),
+            (Dup2 = 33) => do_dup2(old_fd: FileDesc, new_fd: FileDesc),
+            (Pause = 34) => handle_unsupported(),
+            (Nanosleep = 35) => do_nanosleep(req_u: *const timespec_t, rem_u: *mut timespec_t),
+            (Getitimer = 36) => handle_unsupported(),
+            (Alarm = 37) => handle_unsupported(),
+            (Setitimer = 38) => handle_unsupported(),
+            (Getpid = 39) => do_getpid(),
+            (Sendfile = 40) => do_sendfile(out_fd: FileDesc, in_fd: FileDesc, offset_ptr: *mut off_t, count: usize),
+            (Socket = 41) => do_socket(domain: c_int, socket_type: c_int, protocol: c_int),
+            (Connect = 42) => do_connect(fd: c_int, addr: *const libc::sockaddr, addr_len: libc::socklen_t),
+            (Accept = 43) => do_accept(fd: c_int, addr: *mut libc::sockaddr, addr_len: *mut libc::socklen_t),
+            (Sendto = 44) => do_sendto(fd: c_int, base: *const c_void, len: size_t, flags: c_int, addr: *const libc::sockaddr, addr_len: libc::socklen_t),
+            (Recvfrom = 45) => do_recvfrom(fd: c_int, base: *mut c_void, len: size_t, flags: c_int, addr: *mut libc::sockaddr, addr_len: *mut libc::socklen_t),
+            (Sendmsg = 46) => do_sendmsg(fd: c_int, msg_ptr: *const msghdr, flags_c: c_int),
+            (Recvmsg = 47) => do_recvmsg(fd: c_int, msg_mut_ptr: *mut msghdr_mut, flags_c: c_int),
+            (Shutdown = 48) => do_shutdown(fd: c_int, how: c_int),
+            (Bind = 49) => do_bind(fd: c_int, addr: *const libc::sockaddr, addr_len: libc::socklen_t),
+            (Listen = 50) => do_listen(fd: c_int, backlog: c_int),
+            (Getsockname = 51) => do_getsockname(fd: c_int, addr: *mut libc::sockaddr, addr_len: *mut libc::socklen_t),
+            (Getpeername = 52) => do_getpeername(fd: c_int, addr: *mut libc::sockaddr, addr_len: *mut libc::socklen_t),
+            (Socketpair = 53) => do_socketpair(domain: c_int, socket_type: c_int, protocol: c_int, sv: *mut c_int),
+            (Setsockopt = 54) => do_setsockopt(fd: c_int, level: c_int, optname: c_int, optval: *const c_void, optlen: libc::socklen_t),
+            (Getsockopt = 55) => do_getsockopt(fd: c_int, level: c_int, optname: c_int, optval: *mut c_void, optlen: *mut libc::socklen_t),
+            (Clone = 56) => do_clone(flags: u32, stack_addr: usize, ptid: *mut pid_t, ctid: *mut pid_t, new_tls: usize),
+            (Fork = 57) => handle_unsupported(),
+            (Vfork = 58) => do_vfork(context: *mut CpuContext),
+            (Execve = 59) => do_execve(path: *const i8, argv: *const *const i8, envp: *const *const i8, context: *mut CpuContext),
+            (Exit = 60) => do_exit(exit_status: i32),
+            (Wait4 = 61) => do_wait4(pid: i32, _exit_status: *mut i32, options: u32),
+            (Kill = 62) => do_kill(pid: i32, sig: c_int),
+            (Uname = 63) => do_uname(name: *mut utsname_t),
+            (Semget = 64) => handle_unsupported(),
+            (Semop = 65) => handle_unsupported(),
+            (Semctl = 66) => handle_unsupported(),
+            (Shmdt = 67) => handle_unsupported(),
+            (Msgget = 68) => handle_unsupported(),
+            (Msgsnd = 69) => handle_unsupported(),
+            (Msgrcv = 70) => handle_unsupported(),
+            (Msgctl = 71) => handle_unsupported(),
+            (Fcntl = 72) => do_fcntl(fd: FileDesc, cmd: u32, arg: u64),
+            (Flock = 73) => handle_unsupported(),
+            (Fsync = 74) => do_fsync(fd: FileDesc),
+            (Fdatasync = 75) => do_fdatasync(fd: FileDesc),
+            (Truncate = 76) => do_truncate(path: *const i8, len: usize),
+            (Ftruncate = 77) => do_ftruncate(fd: FileDesc, len: usize),
+            (Getdents = 78) => do_getdents(fd: FileDesc, buf: *mut u8, buf_size: usize),
+            (Getcwd = 79) => do_getcwd(buf: *mut u8, size: usize),
+            (Chdir = 80) => do_chdir(path: *const i8),
+            (Fchdir = 81) => do_fchdir(fd: FileDesc),
+            (Rename = 82) => do_rename(oldpath: *const i8, newpath: *const i8),
+            (Mkdir = 83) => do_mkdir(path: *const i8, mode: u16),
+            (Rmdir = 84) => do_rmdir(path: *const i8),
+            (Creat = 85) => do_creat(path: *const i8, mode: u16),
+            (Link = 86) => do_link(oldpath: *const i8, newpath: *const i8),
+            (Unlink = 87) => do_unlink(path: *const i8),
+            (Symlink = 88) => do_symlink(target: *const i8, link_path: *const i8),
+            (Readlink = 89) => do_readlink(path: *const i8, buf: *mut u8, size: usize),
+            (Chmod = 90) => do_chmod(path: *const i8, mode: u16),
+            (Fchmod = 91) => do_fchmod(fd: FileDesc, mode: u16),
+            (Chown = 92) => do_chown(path: *const i8, uid: u32, gid: u32),
+            (Fchown = 93) => do_fchown(fd: FileDesc, uid: u32, gid: u32),
+            (Lchown = 94) => do_lchown(path: *const i8, uid: u32, gid: u32),
+            (Umask = 95) => do_umask(mask: u16),
+            (Gettimeofday = 96) => do_gettimeofday(tv_u: *mut timeval_t),
+            (Getrlimit = 97) => handle_unsupported(),
+            (Getrusage = 98) => handle_unsupported(),
+            (SysInfo = 99) => do_sysinfo(info: *mut sysinfo_t),
+            (Times = 100) => handle_unsupported(),
+            (Ptrace = 101) => handle_unsupported(),
+            (Getuid = 102) => do_getuid(),
+            (SysLog = 103) => handle_unsupported(),
+            (Getgid = 104) => do_getgid(),
+            (Setuid = 105) => handle_unsupported(),
+            (Setgid = 106) => handle_unsupported(),
+            (Geteuid = 107) => do_geteuid(),
+            (Getegid = 108) => do_getegid(),
+            (Setpgid = 109) => do_setpgid(pid: i32, pgid: i32),
+            (Getppid = 110) => do_getppid(),
+            (Getpgrp = 111) => do_getpgrp(),
+            (Setsid = 112) => handle_unsupported(),
+            (Setreuid = 113) => handle_unsupported(),
+            (Setregid = 114) => handle_unsupported(),
+            (Getgroups = 115) => do_getgroups(size: isize, buf_ptr: *mut u32),
+            (Setgroups = 116) => handle_unsupported(),
+            (Setresuid = 117) => handle_unsupported(),
+            (Getresuid = 118) => handle_unsupported(),
+            (Setresgid = 119) => handle_unsupported(),
+            (Getresgid = 120) => handle_unsupported(),
+            (Getpgid = 121) => do_getpgid(pid: i32),
+            (Setfsuid = 122) => handle_unsupported(),
+            (Setfsgid = 123) => handle_unsupported(),
+            (Getsid = 124) => handle_unsupported(),
+            (Capget = 125) => handle_unsupported(),
+            (Capset = 126) => handle_unsupported(),
+            (RtSigpending = 127) => do_rt_sigpending(buf_ptr: *mut sigset_t, buf_size: usize),
+            (RtSigtimedwait = 128) => do_rt_sigtimedwait(mask_ptr: *const sigset_t, info_ptr: *mut siginfo_t, timeout_ptr: *const timespec_t, mask_size: usize),
+            (RtSigqueueinfo = 129) => handle_unsupported(),
+            (RtSigsuspend = 130) => handle_unsupported(),
+            (Sigaltstack = 131) => do_sigaltstack(ss: *const stack_t, old_ss: *mut stack_t, context: *const CpuContext),
+            (Utime = 132) => handle_unsupported(),
+            (Mknod = 133) => handle_unsupported(),
+            (Uselib = 134) => handle_unsupported(),
+            (Personality = 135) => handle_unsupported(),
+            (Ustat = 136) => handle_unsupported(),
+            (Statfs = 137) => do_statfs(path: *const i8, statfs_buf: *mut Statfs),
+            (Fstatfs = 138) => do_fstatfs(fd: FileDesc, statfs_buf: *mut Statfs),
+            (SysFs = 139) => handle_unsupported(),
+            (Getpriority = 140) => handle_unsupported(),
+            (Setpriority = 141) => handle_unsupported(),
+            (SchedSetparam = 142) => handle_unsupported(),
+            (SchedGetparam = 143) => handle_unsupported(),
+            (SchedSetscheduler = 144) => handle_unsupported(),
+            (SchedGetscheduler = 145) => handle_unsupported(),
+            (SchedGetPriorityMax = 146) => handle_unsupported(),
+            (SchedGetPriorityMin = 147) => handle_unsupported(),
+            (SchedRrGetInterval = 148) => handle_unsupported(),
+            (Mlock = 149) => handle_unsupported(),
+            (Munlock = 150) => handle_unsupported(),
+            (Mlockall = 151) => handle_unsupported(),
+            (Munlockall = 152) => handle_unsupported(),
+            (Vhangup = 153) => handle_unsupported(),
+            (ModifyLdt = 154) => handle_unsupported(),
+            (PivotRoot = 155) => handle_unsupported(),
+            (SysCtl = 156) => handle_unsupported(),
+            (Prctl = 157) => do_prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64),
+            (ArchPrctl = 158) => do_arch_prctl(code: u32, addr: *mut usize),
+            (Adjtimex = 159) => handle_unsupported(),
+            (Setrlimit = 160) => handle_unsupported(),
+            (Chroot = 161) => handle_unsupported(),
+            (Sync = 162) => do_sync(),
+            (Acct = 163) => handle_unsupported(),
+            (Settimeofday = 164) => handle_unsupported(),
+            (Mount = 165) => do_mount(source: *const i8, target: *const i8, fs_type: *const i8, flags: u32, options: *const i8),
+            (Umount2 = 166) => do_umount(target: *const i8, flags: u32),
+            (Swapon = 167) => handle_unsupported(),
+            (Swapoff = 168) => handle_unsupported(),
+            (Reboot = 169) => handle_unsupported(),
+            (Sethostname = 170) => handle_unsupported(),
+            (Setdomainname = 171) => handle_unsupported(),
+            (Iopl = 172) => handle_unsupported(),
+            (Ioperm = 173) => handle_unsupported(),
+            (CreateModule = 174) => handle_unsupported(),
+            (InitModule = 175) => handle_unsupported(),
+            (DeleteModule = 176) => handle_unsupported(),
+            (GetKernelSyms = 177) => handle_unsupported(),
+            (QueryModule = 178) => handle_unsupported(),
+            (Quotactl = 179) => handle_unsupported(),
+            (Nfsservctl = 180) => handle_unsupported(),
+            (Getpmsg = 181) => handle_unsupported(),
+            (Putpmsg = 182) => handle_unsupported(),
+            (AfsSysCall = 183) => handle_unsupported(),
+            (Tuxcall = 184) => handle_unsupported(),
+            (Security = 185) => handle_unsupported(),
+            (Gettid = 186) => do_gettid(),
+            (Readahead = 187) => handle_unsupported(),
+            (Setxattr = 188) => handle_unsupported(),
+            (Lsetxattr = 189) => handle_unsupported(),
+            (Fsetxattr = 190) => handle_unsupported(),
+            (Getxattr = 191) => handle_unsupported(),
+            (Lgetxattr = 192) => handle_unsupported(),
+            (Fgetxattr = 193) => handle_unsupported(),
+            (Listxattr = 194) => handle_unsupported(),
+            (Llistxattr = 195) => handle_unsupported(),
+            (Flistxattr = 196) => handle_unsupported(),
+            (Removexattr = 197) => handle_unsupported(),
+            (Lremovexattr = 198) => handle_unsupported(),
+            (Fremovexattr = 199) => handle_unsupported(),
+            (Tkill = 200) => do_tkill(tid: pid_t, sig: c_int),
+            (Time = 201) => do_time(tloc_u: *mut time_t),
+            (Futex = 202) => do_futex(futex_addr: *const i32, futex_op: u32, futex_val: i32, timeout: u64, futex_new_addr: *const i32, bitset: u32),
+            (SchedSetaffinity = 203) => do_sched_setaffinity(pid: pid_t, cpusize: size_t, buf: *const c_uchar),
+            (SchedGetaffinity = 204) => do_sched_getaffinity(pid: pid_t, cpusize: size_t, buf: *mut c_uchar),
+            (SetThreadArea = 205) => handle_unsupported(),
+            (IoSetup = 206) => handle_unsupported(),
+            (IoDestroy = 207) => handle_unsupported(),
+            (IoGetevents = 208) => handle_unsupported(),
+            (IoSubmit = 209) => handle_unsupported(),
+            (IoCancel = 210) => handle_unsupported(),
+            (GetThreadArea = 211) => handle_unsupported(),
+            (LookupDcookie = 212) => handle_unsupported(),
+            (EpollCreate = 213) => do_epoll_create(size: c_int),
+            (EpollCtlOld = 214) => handle_unsupported(),
+            (EpollWaitOld = 215) => handle_unsupported(),
+            (RemapFilePages = 216) => handle_unsupported(),
+            (Getdents64 = 217) => do_getdents64(fd: FileDesc, buf: *mut u8, buf_size: usize),
+            (SetTidAddress = 218) => do_set_tid_address(tidptr: *mut pid_t),
+            (RestartSysCall = 219) => handle_unsupported(),
+            (Semtimedop = 220) => handle_unsupported(),
+            (Fadvise64 = 221) => handle_unsupported(),
+            (TimerCreate = 222) => handle_unsupported(),
+            (TimerSettime = 223) => handle_unsupported(),
+            (TimerGettime = 224) => handle_unsupported(),
+            (TimerGetoverrun = 225) => handle_unsupported(),
+            (TimerDelete = 226) => handle_unsupported(),
+            (ClockSettime = 227) => handle_unsupported(),
+            (ClockGettime = 228) => do_clock_gettime(clockid: clockid_t, ts_u: *mut timespec_t),
+            (ClockGetres = 229) => do_clock_getres(clockid: clockid_t, res_u: *mut timespec_t),
+            (ClockNanosleep = 230) => do_clock_nanosleep(clockid: clockid_t, flags: i32, request: *const timespec_t, remain: *mut timespec_t),
+            (ExitGroup = 231) => do_exit_group(exit_status: i32, user_context: *mut CpuContext),
+            (EpollWait = 232) => do_epoll_wait(epfd: c_int, events: *mut libc::epoll_event, maxevents: c_int, timeout: c_int),
+            (EpollCtl = 233) => do_epoll_ctl(epfd: c_int, op: c_int, fd: c_int, event: *const libc::epoll_event),
+            (Tgkill = 234) => do_tgkill(pid: i32, tid: pid_t, sig: c_int),
+            (Utimes = 235) => handle_unsupported(),
+            (Vserver = 236) => handle_unsupported(),
+            (Mbind = 237) => handle_unsupported(),
+            (SetMempolicy = 238) => handle_unsupported(),
+            (GetMempolicy = 239) => handle_unsupported(),
+            (MqOpen = 240) => handle_unsupported(),
+            (MqUnlink = 241) => handle_unsupported(),
+            (MqTimedsend = 242) => handle_unsupported(),
+            (MqTimedreceive = 243) => handle_unsupported(),
+            (MqNotify = 244) => handle_unsupported(),
+            (MqGetsetattr = 245) => handle_unsupported(),
+            (KexecLoad = 246) => handle_unsupported(),
+            (Waitid = 247) => handle_unsupported(),
+            (AddKey = 248) => handle_unsupported(),
+            (RequestKey = 249) => handle_unsupported(),
+            (Keyctl = 250) => handle_unsupported(),
+            (IoprioSet = 251) => handle_unsupported(),
+            (IoprioGet = 252) => handle_unsupported(),
+            (InotifyInit = 253) => handle_unsupported(),
+            (InotifyAddWatch = 254) => handle_unsupported(),
+            (InotifyRmWatch = 255) => handle_unsupported(),
+            (MigratePages = 256) => handle_unsupported(),
+            (Openat = 257) => do_openat(dirfd: i32, path: *const i8, flags: u32, mode: u16),
+            (Mkdirat = 258) => do_mkdirat(dirfd: i32, path: *const i8, mode: u16),
+            (Mknodat = 259) => handle_unsupported(),
+            (Fchownat = 260) => do_fchownat(dirfd: i32, path: *const i8, uid: u32, gid: u32, flags: i32),
+            (Futimesat = 261) => handle_unsupported(),
+            (Fstatat = 262) => do_fstatat(dirfd: i32, path: *const i8, stat_buf: *mut Stat, flags: u32),
+            (Unlinkat = 263) => do_unlinkat(dirfd: i32, path: *const i8, flags: i32),
+            (Renameat = 264) => do_renameat(olddirfd: i32, oldpath: *const i8, newdirfd: i32, newpath: *const i8),
+            (Linkat = 265) => do_linkat(olddirfd: i32, oldpath: *const i8, newdirfd: i32, newpath: *const i8, flags: i32),
+            (Symlinkat = 266) => do_symlinkat(target: *const i8, new_dirfd: i32, link_path: *const i8),
+            (Readlinkat = 267) => do_readlinkat(dirfd: i32, path: *const i8, buf: *mut u8, size: usize),
+            (Fchmodat = 268) => do_fchmodat(dirfd: i32, path: *const i8, mode: u16),
+            (Faccessat = 269) => do_faccessat(dirfd: i32, path: *const i8, mode: u32, flags: u32),
+            (Pselect6 = 270) => handle_unsupported(),
+            (Ppoll = 271) => do_ppoll(fds: *mut libc::pollfd, nfds: libc::nfds_t, timeout_ts: *const timespec_t, sigmask: *const sigset_t),
+            (Unshare = 272) => handle_unsupported(),
+            (SetRobustList = 273) => do_set_robust_list(list_head_ptr: *mut RobustListHead, len: usize),
+            (GetRobustList = 274) => do_get_robust_list(tid: pid_t, list_head_ptr_ptr: *mut *mut RobustListHead, len_ptr: *mut usize),
+            (Splice = 275) => handle_unsupported(),
+            (Tee = 276) => handle_unsupported(),
+            (SyncFileRange = 277) => handle_unsupported(),
+            (Vmsplice = 278) => handle_unsupported(),
+            (MovePages = 279) => handle_unsupported(),
+            (Utimensat = 280) => handle_unsupported(),
+            (EpollPwait = 281) => do_epoll_pwait(epfd: c_int, events: *mut libc::epoll_event, maxevents: c_int, timeout: c_int, sigmask: *const usize),
+            (Signalfd = 282) => handle_unsupported(),
+            (TimerfdCreate = 283) => do_timerfd_create(clockid: clockid_t, flags: i32 ),
+            (Eventfd = 284) => do_eventfd(init_val: u32),
+            (Fallocate = 285) => do_fallocate(fd: FileDesc, mode: u32, offset: off_t, len: off_t),
+            (TimerfdSettime = 286) => do_timerfd_settime(fd: FileDesc, flags: i32, new_value: *const itimerspec_t, old_value: *mut itimerspec_t),
+            (TimerfdGettime = 287) => do_timerfd_gettime(fd: FileDesc, curr_value: *mut itimerspec_t),
+            (Accept4 = 288) => do_accept4(fd: c_int, addr: *mut libc::sockaddr, addr_len: *mut libc::socklen_t, flags: c_int),
+            (Signalfd4 = 289) => handle_unsupported(),
+            (Eventfd2 = 290) => do_eventfd2(init_val: u32, flags: i32),
+            (EpollCreate1 = 291) => do_epoll_create1(flags: c_int),
+            (Dup3 = 292) => do_dup3(old_fd: FileDesc, new_fd: FileDesc, flags: u32),
+            (Pipe2 = 293) => do_pipe2(fds_u: *mut i32, flags: u32),
+            (InotifyInit1 = 294) => handle_unsupported(),
+            (Preadv = 295) => handle_unsupported(),
+            (Pwritev = 296) => handle_unsupported(),
+            (RtTgsigqueueinfo = 297) => handle_unsupported(),
+            (PerfEventOpen = 298) => handle_unsupported(),
+            (Recvmmsg = 299) => handle_unsupported(),
+            (FanotifyInit = 300) => handle_unsupported(),
+            (FanotifyMark = 301) => handle_unsupported(),
+            (Prlimit64 = 302) => do_prlimit(pid: pid_t, resource: u32, new_limit: *const rlimit_t, old_limit: *mut rlimit_t),
+            (NameToHandleAt = 303) => handle_unsupported(),
+            (OpenByHandleAt = 304) => handle_unsupported(),
+            (ClockAdjtime = 305) => handle_unsupported(),
+            (Syncfs = 306) => handle_unsupported(),
+            (Sendmmsg = 307) => do_sendmmsg(fd: c_int, msg_ptr: *mut mmsghdr, vlen: c_uint, flags_c: c_int),
+            (Setns = 308) => handle_unsupported(),
+            (Getcpu = 309) => do_getcpu(cpu_ptr: *mut u32, node_ptr: *mut u32),
+            (ProcessVmReadv = 310) => handle_unsupported(),
+            (ProcessVmWritev = 311) => handle_unsupported(),
+            (Kcmp = 312) => handle_unsupported(),
+            (FinitModule = 313) => handle_unsupported(),
+            (SchedSetattr = 314) => handle_unsupported(),
+            (SchedGetattr = 315) => handle_unsupported(),
+            (Renameat2 = 316) => handle_unsupported(),
+            (Seccomp = 317) => handle_unsupported(),
+            (Getrandom = 318) => do_getrandom(buf: *mut u8, len: size_t, flags: u32),
+            (MemfdCreate = 319) => handle_unsupported(),
+            (KexecFileLoad = 320) => handle_unsupported(),
+            (Bpf = 321) => handle_unsupported(),
+            (Execveat = 322) => handle_unsupported(),
+            (Userfaultfd = 323) => handle_unsupported(),
+            (Membarrier = 324) => handle_unsupported(),
+            (Mlock2 = 325) => handle_unsupported(),
 
-// Use the internal syscall wrappers from sgx_tstd
-//use std::libc_fs as fs;
-//use std::libc_io as io;
+            // Occlum-specific system calls
+            (SpawnGlibc = 359) => do_spawn_for_glibc(child_pid_ptr: *mut u32, path: *const i8, argv: *const *const i8, envp: *const *const i8, fa: *const SpawnFileActions, attribute_list: *const posix_spawnattr_t),
+            (SpawnMusl = 360) => do_spawn_for_musl(child_pid_ptr: *mut u32, path: *const i8, argv: *const *const i8, envp: *const *const i8, fdop_list: *const FdOp, attribute_list: *const posix_spawnattr_t),
+            (HandleException = 361) => do_handle_exception(info: *mut sgx_exception_info_t, fpregs: *mut FpRegs, context: *mut CpuContext),
+            (HandleInterrupt = 362) => do_handle_interrupt(info: *mut sgx_interrupt_info_t, fpregs: *mut FpRegs, context: *mut CpuContext),
+            (MountRootFS = 363) => do_mount_rootfs(key_ptr: *const sgx_key_128bit_t, occlum_json_mac_ptr: *const sgx_aes_gcm_128bit_tag_t),
+        }
+    };
+}
 
-mod consts;
+/// System call numbers.
+///
+/// The enum is implemented with macros, which expands into the code looks like below:
+/// ```
+/// pub enum SyscallNum {
+///     Read = 0,
+///     Write = 1,
+///     // ...
+/// }
+/// ```
+/// The system call nubmers are named in a way consistent with libc.
+macro_rules! impl_syscall_nums {
+    ($( ( $name: ident = $num: expr ) => $_impl_fn: ident ( $($arg_name:tt : $arg_type: ty),* ) ),+,) => {
+        #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+        #[repr(u32)]
+        pub enum SyscallNum {
+            $(
+                $name = $num,
+            )*
+        }
 
-static mut SYSCALL_TIMING: [usize; 361] = [0; 361];
-
-#[no_mangle]
-#[deny(unreachable_patterns)]
-pub extern "C" fn dispatch_syscall(
-    num: u32,
-    arg0: isize,
-    arg1: isize,
-    arg2: isize,
-    arg3: isize,
-    arg4: isize,
-    arg5: isize,
-) -> isize {
-    debug!(
-        "syscall {}: {:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}",
-        num, arg0, arg1, arg2, arg3, arg4, arg5
-    );
-    #[cfg(feature = "syscall_timing")]
-    let time_start = {
-        static mut LAST_PRINT: usize = 0;
-        let time = crate::time::do_gettimeofday().as_usec();
-        unsafe {
-            if time / 1000000 / 5 > LAST_PRINT {
-                LAST_PRINT = time / 1000000 / 5;
-                print_syscall_timing();
+        impl SyscallNum {
+            pub fn as_str(&self) -> &'static str {
+                use SyscallNum::*;
+                match *self {
+                    #![deny(unreachable_patterns)]
+                    $(
+                        $name => stringify!($name),
+                    )*
+                }
             }
         }
-        time
-    };
 
-    let ret = match num {
-        // file
-        SYS_OPEN => do_open(arg0 as *const i8, arg1 as u32, arg2 as u32),
-        SYS_CLOSE => do_close(arg0 as FileDesc),
-        SYS_READ => do_read(arg0 as FileDesc, arg1 as *mut u8, arg2 as usize),
-        SYS_WRITE => do_write(arg0 as FileDesc, arg1 as *const u8, arg2 as usize),
-        SYS_PREAD64 => do_pread(
-            arg0 as FileDesc,
-            arg1 as *mut u8,
-            arg2 as usize,
-            arg3 as usize,
-        ),
-        SYS_PWRITE64 => do_pwrite(
-            arg0 as FileDesc,
-            arg1 as *const u8,
-            arg2 as usize,
-            arg3 as usize,
-        ),
-        SYS_READV => do_readv(arg0 as FileDesc, arg1 as *mut iovec_t, arg2 as i32),
-        SYS_WRITEV => do_writev(arg0 as FileDesc, arg1 as *mut iovec_t, arg2 as i32),
-        SYS_STAT => do_stat(arg0 as *const i8, arg1 as *mut fs::Stat),
-        SYS_FSTAT => do_fstat(arg0 as FileDesc, arg1 as *mut fs::Stat),
-        SYS_LSTAT => do_lstat(arg0 as *const i8, arg1 as *mut fs::Stat),
-        SYS_ACCESS => do_access(arg0 as *const i8, arg1 as u32),
-        SYS_FACCESSAT => do_faccessat(arg0 as i32, arg1 as *const i8, arg2 as u32, arg3 as u32),
-        SYS_LSEEK => do_lseek(arg0 as FileDesc, arg1 as off_t, arg2 as i32),
-        SYS_FSYNC => do_fsync(arg0 as FileDesc),
-        SYS_FDATASYNC => do_fdatasync(arg0 as FileDesc),
-        SYS_TRUNCATE => do_truncate(arg0 as *const i8, arg1 as usize),
-        SYS_FTRUNCATE => do_ftruncate(arg0 as FileDesc, arg1 as usize),
-        SYS_GETDENTS64 => do_getdents64(arg0 as FileDesc, arg1 as *mut u8, arg2 as usize),
-        SYS_SYNC => do_sync(),
-        SYS_GETCWD => do_getcwd(arg0 as *mut u8, arg1 as usize),
-        SYS_CHDIR => do_chdir(arg0 as *mut i8),
-        SYS_RENAME => do_rename(arg0 as *const i8, arg1 as *const i8),
-        SYS_MKDIR => do_mkdir(arg0 as *const i8, arg1 as usize),
-        SYS_RMDIR => do_rmdir(arg0 as *const i8),
-        SYS_LINK => do_link(arg0 as *const i8, arg1 as *const i8),
-        SYS_UNLINK => do_unlink(arg0 as *const i8),
-        SYS_READLINK => do_readlink(arg0 as *const i8, arg1 as *mut u8, arg2 as usize),
-        SYS_SENDFILE => do_sendfile(
-            arg0 as FileDesc,
-            arg1 as FileDesc,
-            arg2 as *mut off_t,
-            arg3 as usize,
-        ),
-        SYS_FCNTL => do_fcntl(arg0 as FileDesc, arg1 as u32, arg2 as u64),
-        SYS_IOCTL => do_ioctl(arg0 as FileDesc, arg1 as c_int, arg2 as *mut c_int),
+        impl TryFrom<u32> for SyscallNum {
+            type Error = error::Error;
 
-        // IO multiplexing
-        SYS_SELECT => do_select(
-            arg0 as c_int,
-            arg1 as *mut libc::fd_set,
-            arg2 as *mut libc::fd_set,
-            arg3 as *mut libc::fd_set,
-            arg4 as *const libc::timeval,
-        ),
-        SYS_POLL => do_poll(
-            arg0 as *mut libc::pollfd,
-            arg1 as libc::nfds_t,
-            arg2 as c_int,
-        ),
-        SYS_EPOLL_CREATE => do_epoll_create(arg0 as c_int),
-        SYS_EPOLL_CREATE1 => do_epoll_create1(arg0 as c_int),
-        SYS_EPOLL_CTL => do_epoll_ctl(
-            arg0 as c_int,
-            arg1 as c_int,
-            arg2 as c_int,
-            arg3 as *const libc::epoll_event,
-        ),
-        SYS_EPOLL_WAIT => do_epoll_wait(
-            arg0 as c_int,
-            arg1 as *mut libc::epoll_event,
-            arg2 as c_int,
-            arg3 as c_int,
-        ),
-
-        // process
-        SYS_EXIT => do_exit(arg0 as i32),
-        SYS_SPAWN => do_spawn(
-            arg0 as *mut u32,
-            arg1 as *mut i8,
-            arg2 as *const *const i8,
-            arg3 as *const *const i8,
-            arg4 as *const FdOp,
-        ),
-        SYS_WAIT4 => do_wait4(arg0 as i32, arg1 as *mut i32),
-
-        SYS_GETPID => do_getpid(),
-        SYS_GETTID => do_gettid(),
-        SYS_GETPPID => do_getppid(),
-        SYS_GETPGID => do_getpgid(),
-
-        SYS_GETUID => do_getuid(),
-        SYS_GETGID => do_getgid(),
-        SYS_GETEUID => do_geteuid(),
-        SYS_GETEGID => do_getegid(),
-
-        SYS_RT_SIGACTION => do_rt_sigaction(),
-        SYS_RT_SIGPROCMASK => do_rt_sigprocmask(),
-
-        SYS_CLONE => do_clone(
-            arg0 as u32,
-            arg1 as usize,
-            arg2 as *mut pid_t,
-            arg3 as *mut pid_t,
-            arg4 as usize,
-        ),
-        SYS_FUTEX => do_futex(
-            arg0 as *const i32,
-            arg1 as u32,
-            arg2 as i32,
-            // TODO: accept other optional arguments
-        ),
-        SYS_ARCH_PRCTL => do_arch_prctl(arg0 as u32, arg1 as *mut usize),
-        SYS_SET_TID_ADDRESS => do_set_tid_address(arg0 as *mut pid_t),
-        SYS_SCHED_GETAFFINITY => {
-            do_sched_getaffinity(arg0 as pid_t, arg1 as size_t, arg2 as *mut c_uchar)
-        }
-        SYS_SCHED_SETAFFINITY => {
-            do_sched_setaffinity(arg0 as pid_t, arg1 as size_t, arg2 as *const c_uchar)
+            fn try_from(raw_num: u32) -> Result<Self> {
+                match raw_num {
+                    $(
+                        $num => Ok(Self::$name),
+                    )*
+                    _ => return_errno!(SyscallNumError::new(raw_num)),
+                }
+            }
         }
 
-        // memory
-        SYS_MMAP => do_mmap(
-            arg0 as usize,
-            arg1 as usize,
-            arg2 as i32,
-            arg3 as i32,
-            arg4 as FileDesc,
-            arg5 as off_t,
-        ),
-        SYS_MUNMAP => do_munmap(arg0 as usize, arg1 as usize),
-        SYS_MREMAP => do_mremap(
-            arg0 as usize,
-            arg1 as usize,
-            arg2 as usize,
-            arg3 as i32,
-            arg4 as usize,
-        ),
-        SYS_MPROTECT => do_mprotect(arg0 as usize, arg1 as usize, arg2 as u32),
-        SYS_BRK => do_brk(arg0 as usize),
+        #[derive(Copy, Clone, Debug)]
+        pub struct SyscallNumError {
+            invalid_num: u32,
+        }
 
-        SYS_PIPE => do_pipe2(arg0 as *mut i32, 0),
-        SYS_PIPE2 => do_pipe2(arg0 as *mut i32, arg1 as u32),
-        SYS_DUP => do_dup(arg0 as FileDesc),
-        SYS_DUP2 => do_dup2(arg0 as FileDesc, arg1 as FileDesc),
-        SYS_DUP3 => do_dup3(arg0 as FileDesc, arg1 as FileDesc, arg2 as u32),
+        impl SyscallNumError {
+            pub fn new(invalid_num: u32) -> Self {
+                Self { invalid_num }
+            }
+        }
 
-        SYS_GETTIMEOFDAY => do_gettimeofday(arg0 as *mut timeval_t),
-        SYS_CLOCK_GETTIME => do_clock_gettime(arg0 as clockid_t, arg1 as *mut timespec_t),
+        impl ToErrno for SyscallNumError {
+            fn errno(&self) -> Errno {
+                EINVAL
+            }
+        }
 
-        SYS_UNAME => do_uname(arg0 as *mut utsname_t),
-
-        SYS_PRLIMIT64 => do_prlimit(
-            arg0 as pid_t,
-            arg1 as u32,
-            arg2 as *const rlimit_t,
-            arg3 as *mut rlimit_t,
-        ),
-
-        // socket
-        SYS_SOCKET => do_socket(arg0 as c_int, arg1 as c_int, arg2 as c_int),
-        SYS_CONNECT => do_connect(
-            arg0 as c_int,
-            arg1 as *const libc::sockaddr,
-            arg2 as libc::socklen_t,
-        ),
-        SYS_ACCEPT => do_accept4(
-            arg0 as c_int,
-            arg1 as *mut libc::sockaddr,
-            arg2 as *mut libc::socklen_t,
-            0,
-        ),
-        SYS_ACCEPT4 => do_accept4(
-            arg0 as c_int,
-            arg1 as *mut libc::sockaddr,
-            arg2 as *mut libc::socklen_t,
-            arg3 as c_int,
-        ),
-        SYS_SHUTDOWN => do_shutdown(arg0 as c_int, arg1 as c_int),
-        SYS_BIND => do_bind(
-            arg0 as c_int,
-            arg1 as *const libc::sockaddr,
-            arg2 as libc::socklen_t,
-        ),
-        SYS_LISTEN => do_listen(arg0 as c_int, arg1 as c_int),
-        SYS_SETSOCKOPT => do_setsockopt(
-            arg0 as c_int,
-            arg1 as c_int,
-            arg2 as c_int,
-            arg3 as *const c_void,
-            arg4 as libc::socklen_t,
-        ),
-        SYS_GETSOCKOPT => do_getsockopt(
-            arg0 as c_int,
-            arg1 as c_int,
-            arg2 as c_int,
-            arg3 as *mut c_void,
-            arg4 as *mut libc::socklen_t,
-        ),
-        SYS_GETPEERNAME => do_getpeername(
-            arg0 as c_int,
-            arg1 as *mut libc::sockaddr,
-            arg2 as *mut libc::socklen_t,
-        ),
-        SYS_GETSOCKNAME => do_getsockname(
-            arg0 as c_int,
-            arg1 as *mut libc::sockaddr,
-            arg2 as *mut libc::socklen_t,
-        ),
-        SYS_SENDTO => do_sendto(
-            arg0 as c_int,
-            arg1 as *const c_void,
-            arg2 as size_t,
-            arg3 as c_int,
-            arg4 as *const libc::sockaddr,
-            arg5 as libc::socklen_t,
-        ),
-        SYS_RECVFROM => do_recvfrom(
-            arg0 as c_int,
-            arg1 as *mut c_void,
-            arg2 as size_t,
-            arg3 as c_int,
-            arg4 as *mut libc::sockaddr,
-            arg5 as *mut libc::socklen_t,
-        ),
-
-        _ => do_unknown(num, arg0, arg1, arg2, arg3, arg4, arg5),
-    };
-
-    #[cfg(feature = "syscall_timing")]
-    {
-        let time_end = crate::time::do_gettimeofday().as_usec();
-        let time = time_end - time_start;
-        unsafe {
-            SYSCALL_TIMING[num as usize] += time as usize;
+        impl std::fmt::Display for SyscallNumError {
+            fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(f, "Invalid system call number ({})", self.invalid_num)
+            }
         }
     }
+}
+/// Generate system call numbers.
+process_syscall_table_with_callback!(impl_syscall_nums);
 
-    info!("=> {:?}", ret);
+/// A struct that represents a system call
+struct Syscall {
+    num: SyscallNum,
+    args: [isize; 6],
+}
 
-    match ret {
+impl Syscall {
+    pub fn new(
+        num: u32,
+        arg0: isize,
+        arg1: isize,
+        arg2: isize,
+        arg3: isize,
+        arg4: isize,
+        arg5: isize,
+    ) -> Result<Self> {
+        let num = SyscallNum::try_from(num)?;
+        let args = [arg0, arg1, arg2, arg3, arg4, arg5];
+        Ok(Self { num, args })
+    }
+}
+
+/// Generate the code that can format any system call.
+macro_rules! impl_fmt_syscall {
+    // Internal rules
+    (@fmt_args $self_:ident, $f:ident, $arg_i:expr, ($(,)?)) => {};
+    (@fmt_args $self_:ident, $f:ident, $arg_i:expr, ($arg_name:ident : $arg_type:ty, $($more_args:tt)*)) => {
+        let arg_val = $self_.args[$arg_i] as $arg_type;
+        write!($f, ", {} = {:?}", stringify!($arg_name), arg_val)?;
+        impl_fmt_syscall!(@fmt_args $self_, $f, ($arg_i + 1), ($($more_args)*));
+    };
+
+    // Main rule
+    ($( ( $name:ident = $num:expr ) => $fn:ident ( $($args:tt)* ) ),+,) => {
+        impl std::fmt::Debug for Syscall {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "Syscall {{ num = {:?}", self.num)?;
+                match self.num {
+                    #![deny(unreachable_patterns)]
+                    $(
+                        // Expands into something like below:
+                        //
+                        // SyscallNum::Read => {
+                        //     let arg_val = self.args[0] as FileDesc;
+                        //     write!(f, ", {} = {:?}", "fd", arg_val);
+                        //     let arg_val = self.args[1] as *mut u8;
+                        //     write!(f, ", {} = {:?}", "buf", arg_val);
+                        //     let arg_val = self.args[2] as usize;
+                        //     write!(f, ", {} = {:?}", "size", arg_val);
+                        // }
+                        SyscallNum::$name => {
+                            impl_fmt_syscall!(@fmt_args self, f, 0, ($($args)*,));
+                        },
+                    )*
+                };
+                write!(f, " }}")
+            }
+        }
+    }
+}
+process_syscall_table_with_callback!(impl_fmt_syscall);
+
+/// Generate the code that can dispatch any system call to its actual implementation function.
+macro_rules! impl_dispatch_syscall {
+    (@do_syscall $fn:ident, $syscall:ident, $arg_i:expr, ($(,)?) -> ($($output:tt)*) ) => {
+        impl_dispatch_syscall!(@as_expr $fn($($output)*))
+    };
+    (@do_syscall $fn:ident, $syscall:ident, $arg_i:expr, ($_arg_name:ident : $arg_type:ty, $($more_args:tt)*) -> ($($output:tt)*)) => {
+        impl_dispatch_syscall!(@do_syscall $fn, $syscall, ($arg_i + 1), ($($more_args)*) -> ($($output)* ($syscall.args[$arg_i] as $arg_type),))
+    };
+    (@as_expr $e:expr) => { $e };
+
+    ($( ( $name:ident = $num:expr ) => $fn:ident ( $($args:tt)* ) ),+,) => {
+        fn dispatch_syscall(syscall: Syscall) -> Result<isize> {
+            match syscall.num {
+                #![deny(unreachable_patterns)]
+                $(
+                    // Expands into something like below:
+                    //
+                    // SyscallNum::Read => {
+                    //     let fd = self.args[0] as FileDesc;
+                    //     let buf = self.args[1] as *mut u8;
+                    //     let size = self.args[2] as usize;
+                    //     do_read(fd, buf, size)
+                    // }
+                    SyscallNum::$name => {
+                        impl_dispatch_syscall!(@do_syscall $fn, syscall, 0, ($($args)*,) -> ())
+                    },
+                )*
+            }
+        }
+    }
+}
+process_syscall_table_with_callback!(impl_dispatch_syscall);
+
+#[no_mangle]
+pub extern "C" fn occlum_syscall(user_context: *mut CpuContext) -> ! {
+    // Start a new round of log messages for this system call. But we do not
+    // set the description of this round, yet. We will do so after checking the
+    // given system call number is a valid.
+    log::next_round(None);
+
+    let user_context = unsafe {
+        // TODO: validate pointer
+        &mut *user_context
+    };
+
+    // Do system call
+    do_syscall(user_context);
+
+    // Back to the user space
+    do_sysret(user_context)
+}
+
+fn do_syscall(user_context: &mut CpuContext) {
+    // Extract arguments from the CPU context. The arguments follows Linux's syscall ABI.
+    let num = user_context.rax as u32;
+    let arg0 = user_context.rdi as isize;
+    let arg1 = user_context.rsi as isize;
+    let arg2 = user_context.rdx as isize;
+    let arg3 = user_context.r10 as isize;
+    let arg4 = user_context.r8 as isize;
+    let arg5 = user_context.r9 as isize;
+
+    let ret = Syscall::new(num, arg0, arg1, arg2, arg3, arg4, arg5).and_then(|mut syscall| {
+        log::set_round_desc(Some(syscall.num.as_str()));
+        trace!("{:?}", &syscall);
+        let syscall_num = syscall.num;
+
+        // Pass user_context as an extra argument to two special syscalls that
+        // need to modify it
+        if syscall_num == SyscallNum::RtSigreturn {
+            syscall.args[0] = user_context as *mut _ as isize;
+        } else if syscall_num == SyscallNum::Vfork {
+            syscall.args[0] = user_context as *mut _ as isize;
+        } else if syscall_num == SyscallNum::Execve {
+            // syscall.args[0] == path
+            // syscall.args[1] == argv
+            // syscall.args[2] == envp
+            syscall.args[3] = user_context as *mut _ as isize;
+        } else if syscall_num == SyscallNum::ExitGroup {
+            // syscall.args[0] == status
+            syscall.args[1] = user_context as *mut _ as isize;
+        } else if syscall_num == SyscallNum::HandleException {
+            // syscall.args[0] == info
+            // syscall.args[1] == fpregs
+            syscall.args[2] = user_context as *mut _ as isize;
+        } else if syscall.num == SyscallNum::HandleInterrupt {
+            // syscall.args[0] == info
+            // syscall.args[1] == fpregs
+            syscall.args[2] = user_context as *mut _ as isize;
+        } else if syscall.num == SyscallNum::Sigaltstack {
+            // syscall.args[0] == new_ss
+            // syscall.args[1] == old_ss
+            syscall.args[2] = user_context as *const _ as isize;
+        }
+
+        #[cfg(feature = "syscall_timing")]
+        current!()
+            .profiler()
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .syscall_enter(syscall_num)
+            .expect("unexpected error from profiler to enter syscall");
+
+        let ret = dispatch_syscall(syscall);
+
+        #[cfg(feature = "syscall_timing")]
+        current!()
+            .profiler()
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .syscall_exit(syscall_num, ret.is_err())
+            .expect("unexpected error from profiler to exit syscall");
+
+        ret
+    });
+
+    let retval = match ret {
         Ok(retval) => retval as isize,
         Err(e) => {
-            warn!("{}", e.backtrace());
+            let should_log_err = |errno| {
+                // If the log level requires every detail, don't ignore any error
+                if log::max_level() == LevelFilter::Trace {
+                    return true;
+                }
+
+                // All other log levels require errors to be outputed. But
+                // some errnos are usually benign and may occur in a very high
+                // frequency. So we want to ignore them to keep noises at a
+                // minimum level in the log.
+                //
+                // TODO: use a smarter, frequency-based strategy to decide whether
+                // to suppress error messages.
+                match errno {
+                    EAGAIN | ETIMEDOUT => false,
+                    _ => true,
+                }
+            };
+            if should_log_err(e.errno()) {
+                error!("Error = {}", e.backtrace());
+            }
 
             let retval = -(e.errno() as isize);
             debug_assert!(retval != 0);
             retval
         }
+    };
+    trace!("Retval = 0x{:x}", retval);
+
+    // Put the return value into user_context.rax, except for syscalls that may
+    // modify user_context directly. Currently, there are three such syscalls:
+    // SigReturn, HandleException, and HandleInterrupt.
+    //
+    // Sigreturn restores `user_context` to the state when the last signal
+    // handler is executed. So in the case of sigreturn, `user_context` should
+    // be kept intact.
+    if num != SyscallNum::RtSigreturn as u32
+        && num != SyscallNum::HandleException as u32
+        && num != SyscallNum::HandleInterrupt as u32
+    {
+        user_context.rax = retval as u64;
     }
+
+    crate::signal::deliver_signal(user_context);
+
+    crate::process::handle_force_exit();
 }
 
-#[cfg(feature = "syscall_timing")]
-fn print_syscall_timing() {
-    println!("syscall timing:");
-    for (i, &time) in unsafe { SYSCALL_TIMING }.iter().enumerate() {
-        if time == 0 {
-            continue;
+/// Return to the user space according to the given CPU context
+fn do_sysret(user_context: &mut CpuContext) -> ! {
+    // Rust compiler would complain about passing to external C functions a CpuContext
+    // pointer, which includes a FpRegs pointer that is not safe to use by external
+    // modules. In our case, the FpRegs pointer will not be used actually. So the
+    // Rust warning is a false alarm. We suppress it here.
+    #[allow(improper_ctypes)]
+    extern "C" {
+        fn __occlum_sysret(user_context: *mut CpuContext) -> !;
+        fn do_exit_task() -> !;
+    }
+    if current!().status() != ThreadStatus::Exited {
+        // Restore the floating point registers
+        // Todo: Is it correct to do fxstor in kernel?
+        let fpregs = user_context.fpregs;
+        if (fpregs != ptr::null_mut()) {
+            if user_context.fpregs_on_heap == 1 {
+                let fpregs = unsafe { Box::from_raw(user_context.fpregs as *mut FpRegs) };
+                fpregs.restore();
+            } else {
+                unsafe { fpregs.as_ref().unwrap().restore() };
+            }
         }
-        println!("{:>3}: {:>6} us", i, time);
+        unsafe { __occlum_sysret(user_context) } // jump to user space
+    } else {
+        if user_context.fpregs != ptr::null_mut() && user_context.fpregs_on_heap == 1 {
+            drop(unsafe { Box::from_raw(user_context.fpregs as *mut FpRegs) });
+        }
+        unsafe { do_exit_task() } // exit enclave
     }
-    for x in unsafe { SYSCALL_TIMING.iter_mut() } {
-        *x = 0;
-    }
-}
-
-#[allow(non_camel_case_types)]
-pub struct iovec_t {
-    base: *const c_void,
-    len: size_t,
+    unreachable!("__occlum_sysret never returns!");
 }
 
 /*
@@ -340,322 +771,6 @@ pub struct iovec_t {
 const FDOP_CLOSE: u32 = 1;
 const FDOP_DUP2: u32 = 2;
 const FDOP_OPEN: u32 = 3;
-
-#[repr(C)]
-#[derive(Debug)]
-pub struct FdOp {
-    // We actually switch the prev and next fields in the libc definition.
-    prev: *const FdOp,
-    next: *const FdOp,
-    cmd: u32,
-    fd: u32,
-    srcfd: u32,
-    oflag: u32,
-    mode: u32,
-    path: *const i8,
-}
-
-fn clone_file_actions_safely(fdop_ptr: *const FdOp) -> Result<Vec<FileAction>> {
-    let mut file_actions = Vec::new();
-
-    let mut fdop_ptr = fdop_ptr;
-    while fdop_ptr != ptr::null() {
-        check_ptr(fdop_ptr)?;
-        let fdop = unsafe { &*fdop_ptr };
-
-        let file_action = match fdop.cmd {
-            FDOP_CLOSE => FileAction::Close(fdop.fd),
-            FDOP_DUP2 => FileAction::Dup2(fdop.srcfd, fdop.fd),
-            FDOP_OPEN => FileAction::Open {
-                path: clone_cstring_safely(fdop.path)?
-                    .to_string_lossy()
-                    .into_owned(),
-                mode: fdop.mode,
-                oflag: fdop.oflag,
-                fd: fdop.fd,
-            },
-            _ => {
-                return_errno!(EINVAL, "Unknown file action command");
-            }
-        };
-        file_actions.push(file_action);
-
-        fdop_ptr = fdop.next;
-    }
-
-    Ok(file_actions)
-}
-
-fn do_spawn(
-    child_pid_ptr: *mut u32,
-    path: *const i8,
-    argv: *const *const i8,
-    envp: *const *const i8,
-    fdop_list: *const FdOp,
-) -> Result<isize> {
-    check_mut_ptr(child_pid_ptr)?;
-    let path = clone_cstring_safely(path)?.to_string_lossy().into_owned();
-    let argv = clone_cstrings_safely(argv)?;
-    let envp = clone_cstrings_safely(envp)?;
-    let file_actions = clone_file_actions_safely(fdop_list)?;
-    let parent = process::get_current();
-    info!(
-        "spawn: path: {:?}, argv: {:?}, envp: {:?}, fdop: {:?}",
-        path, argv, envp, file_actions
-    );
-
-    let child_pid = process::do_spawn(&path, &argv, &envp, &file_actions, &parent)?;
-
-    unsafe { *child_pid_ptr = child_pid };
-    Ok(0)
-}
-
-pub fn do_clone(
-    flags: u32,
-    stack_addr: usize,
-    ptid: *mut pid_t,
-    ctid: *mut pid_t,
-    new_tls: usize,
-) -> Result<isize> {
-    let flags = CloneFlags::from_bits_truncate(flags);
-    check_mut_ptr(stack_addr as *mut u64)?;
-    let ptid = {
-        if flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
-            check_mut_ptr(ptid)?;
-            Some(ptid)
-        } else {
-            None
-        }
-    };
-    let ctid = {
-        if flags.contains(CloneFlags::CLONE_CHILD_CLEARTID) {
-            check_mut_ptr(ctid)?;
-            Some(ctid)
-        } else {
-            None
-        }
-    };
-    let new_tls = {
-        if flags.contains(CloneFlags::CLONE_SETTLS) {
-            check_mut_ptr(new_tls as *mut usize)?;
-            Some(new_tls)
-        } else {
-            None
-        }
-    };
-
-    let child_pid = process::do_clone(flags, stack_addr, ptid, ctid, new_tls)?;
-
-    Ok(child_pid as isize)
-}
-
-pub fn do_futex(futex_addr: *const i32, futex_op: u32, futex_val: i32) -> Result<isize> {
-    check_ptr(futex_addr)?;
-    let (futex_op, futex_flags) = process::futex_op_and_flags_from_u32(futex_op)?;
-    match futex_op {
-        FutexOp::FUTEX_WAIT => process::futex_wait(futex_addr, futex_val).map(|_| 0),
-        FutexOp::FUTEX_WAKE => {
-            let max_count = {
-                if futex_val < 0 {
-                    return_errno!(EINVAL, "the count must not be negative");
-                }
-                futex_val as usize
-            };
-            process::futex_wake(futex_addr, max_count).map(|count| count as isize)
-        }
-        _ => return_errno!(ENOSYS, "the futex operation is not supported"),
-    }
-}
-
-fn do_open(path: *const i8, flags: u32, mode: u32) -> Result<isize> {
-    let path = clone_cstring_safely(path)?.to_string_lossy().into_owned();
-    let fd = fs::do_open(&path, flags, mode)?;
-    Ok(fd as isize)
-}
-
-fn do_close(fd: FileDesc) -> Result<isize> {
-    fs::do_close(fd)?;
-    Ok(0)
-}
-
-fn do_read(fd: FileDesc, buf: *mut u8, size: usize) -> Result<isize> {
-    let safe_buf = {
-        check_mut_array(buf, size)?;
-        unsafe { std::slice::from_raw_parts_mut(buf, size) }
-    };
-    let len = fs::do_read(fd, safe_buf)?;
-    Ok(len as isize)
-}
-
-fn do_write(fd: FileDesc, buf: *const u8, size: usize) -> Result<isize> {
-    let safe_buf = {
-        check_array(buf, size)?;
-        unsafe { std::slice::from_raw_parts(buf, size) }
-    };
-    let len = fs::do_write(fd, safe_buf)?;
-    Ok(len as isize)
-}
-
-fn do_writev(fd: FileDesc, iov: *const iovec_t, count: i32) -> Result<isize> {
-    let count = {
-        if count < 0 {
-            return_errno!(EINVAL, "Invalid count of iovec");
-        }
-        count as usize
-    };
-
-    check_array(iov, count);
-    let bufs_vec = {
-        let mut bufs_vec = Vec::with_capacity(count);
-        for iov_i in 0..count {
-            let iov_ptr = unsafe { iov.offset(iov_i as isize) };
-            let iov = unsafe { &*iov_ptr };
-            let buf = unsafe { std::slice::from_raw_parts(iov.base as *const u8, iov.len) };
-            bufs_vec.push(buf);
-        }
-        bufs_vec
-    };
-    let bufs = &bufs_vec[..];
-
-    let len = fs::do_writev(fd, bufs)?;
-    Ok(len as isize)
-}
-
-fn do_readv(fd: FileDesc, iov: *mut iovec_t, count: i32) -> Result<isize> {
-    let count = {
-        if count < 0 {
-            return_errno!(EINVAL, "Invalid count of iovec");
-        }
-        count as usize
-    };
-
-    check_array(iov, count);
-    let mut bufs_vec = {
-        let mut bufs_vec = Vec::with_capacity(count);
-        for iov_i in 0..count {
-            let iov_ptr = unsafe { iov.offset(iov_i as isize) };
-            let iov = unsafe { &*iov_ptr };
-            let buf = unsafe { std::slice::from_raw_parts_mut(iov.base as *mut u8, iov.len) };
-            bufs_vec.push(buf);
-        }
-        bufs_vec
-    };
-    let bufs = &mut bufs_vec[..];
-
-    let len = fs::do_readv(fd, bufs)?;
-    Ok(len as isize)
-}
-
-fn do_pread(fd: FileDesc, buf: *mut u8, size: usize, offset: usize) -> Result<isize> {
-    let safe_buf = {
-        check_mut_array(buf, size)?;
-        unsafe { std::slice::from_raw_parts_mut(buf, size) }
-    };
-    let len = fs::do_pread(fd, safe_buf, offset)?;
-    Ok(len as isize)
-}
-
-fn do_pwrite(fd: FileDesc, buf: *const u8, size: usize, offset: usize) -> Result<isize> {
-    let safe_buf = {
-        check_array(buf, size)?;
-        unsafe { std::slice::from_raw_parts(buf, size) }
-    };
-    let len = fs::do_pwrite(fd, safe_buf, offset)?;
-    Ok(len as isize)
-}
-
-fn do_stat(path: *const i8, stat_buf: *mut fs::Stat) -> Result<isize> {
-    let path = clone_cstring_safely(path)?.to_string_lossy().into_owned();
-    check_mut_ptr(stat_buf)?;
-
-    let stat = fs::do_stat(&path)?;
-    unsafe {
-        stat_buf.write(stat);
-    }
-    Ok(0)
-}
-
-fn do_fstat(fd: FileDesc, stat_buf: *mut fs::Stat) -> Result<isize> {
-    check_mut_ptr(stat_buf)?;
-
-    let stat = fs::do_fstat(fd)?;
-    unsafe {
-        stat_buf.write(stat);
-    }
-    Ok(0)
-}
-
-fn do_lstat(path: *const i8, stat_buf: *mut fs::Stat) -> Result<isize> {
-    let path = clone_cstring_safely(path)?.to_string_lossy().into_owned();
-    check_mut_ptr(stat_buf)?;
-
-    let stat = fs::do_lstat(&path)?;
-    unsafe {
-        stat_buf.write(stat);
-    }
-    Ok(0)
-}
-
-fn do_lseek(fd: FileDesc, offset: off_t, whence: i32) -> Result<isize> {
-    let seek_from = match whence {
-        0 => {
-            // SEEK_SET
-            if offset < 0 {
-                return_errno!(EINVAL, "Invalid offset");
-            }
-            SeekFrom::Start(offset as u64)
-        }
-        1 => {
-            // SEEK_CUR
-            SeekFrom::Current(offset)
-        }
-        2 => {
-            // SEEK_END
-            SeekFrom::End(offset)
-        }
-        _ => {
-            return_errno!(EINVAL, "Invalid whence");
-        }
-    };
-
-    let offset = fs::do_lseek(fd, seek_from)?;
-    Ok(offset as isize)
-}
-
-fn do_fsync(fd: FileDesc) -> Result<isize> {
-    fs::do_fsync(fd)?;
-    Ok(0)
-}
-
-fn do_fdatasync(fd: FileDesc) -> Result<isize> {
-    fs::do_fdatasync(fd)?;
-    Ok(0)
-}
-
-fn do_truncate(path: *const i8, len: usize) -> Result<isize> {
-    let path = clone_cstring_safely(path)?.to_string_lossy().into_owned();
-    fs::do_truncate(&path, len)?;
-    Ok(0)
-}
-
-fn do_ftruncate(fd: FileDesc, len: usize) -> Result<isize> {
-    fs::do_ftruncate(fd, len)?;
-    Ok(0)
-}
-
-fn do_getdents64(fd: FileDesc, buf: *mut u8, buf_size: usize) -> Result<isize> {
-    let safe_buf = {
-        check_mut_array(buf, buf_size)?;
-        unsafe { std::slice::from_raw_parts_mut(buf, buf_size) }
-    };
-    let len = fs::do_getdents64(fd, safe_buf)?;
-    Ok(len as isize)
-}
-
-fn do_sync() -> Result<isize> {
-    fs::do_sync()?;
-    Ok(0)
-}
 
 fn do_mmap(
     addr: usize,
@@ -683,12 +798,14 @@ fn do_mremap(
     flags: i32,
     new_addr: usize,
 ) -> Result<isize> {
-    warn!("mremap: not implemented!");
-    return_errno!(ENOSYS, "not supported yet")
+    let flags = MRemapFlags::from_raw(flags as u32, new_addr)?;
+    let addr = vm::do_mremap(old_addr, old_size, new_size, flags)?;
+    Ok(addr as isize)
 }
 
-fn do_mprotect(addr: usize, len: usize, prot: u32) -> Result<isize> {
-    // TODO: implement it
+fn do_mprotect(addr: usize, len: usize, perms: u32) -> Result<isize> {
+    let perms = VMPerms::from_u32(perms as u32)?;
+    vm::do_mprotect(addr, len, perms)?;
     Ok(0)
 }
 
@@ -697,99 +814,31 @@ fn do_brk(new_brk_addr: usize) -> Result<isize> {
     Ok(ret_brk_addr as isize)
 }
 
-fn do_wait4(pid: i32, _exit_status: *mut i32) -> Result<isize> {
-    if !_exit_status.is_null() {
-        check_mut_ptr(_exit_status)?;
-    }
+fn do_msync(addr: usize, size: usize, flags: u32) -> Result<isize> {
+    let flags = MSyncFlags::from_u32(flags)?;
+    vm::do_msync(addr, size, flags)?;
+    Ok(0)
+}
 
-    let child_process_filter = match pid {
-        pid if pid < -1 => process::ChildProcessFilter::WithPGID((-pid) as pid_t),
-        -1 => process::ChildProcessFilter::WithAnyPID,
-        0 => {
-            let pgid = process::do_getpgid();
-            process::ChildProcessFilter::WithPGID(pgid)
-        }
-        pid if pid > 0 => process::ChildProcessFilter::WithPID(pid as pid_t),
-        _ => {
-            panic!("THIS SHOULD NEVER HAPPEN!");
-        }
+fn do_sysinfo(info: *mut sysinfo_t) -> Result<isize> {
+    check_mut_ptr(info)?;
+    let info = unsafe { &mut *info };
+    *info = misc::do_sysinfo()?;
+    Ok(0)
+}
+
+fn do_getrandom(buf: *mut u8, len: size_t, flags: u32) -> Result<isize> {
+    check_mut_array(buf, len)?;
+    let checked_len = if len > u32::MAX as usize {
+        u32::MAX as usize
+    } else {
+        len
     };
-    let mut exit_status = 0;
-    match process::do_wait4(&child_process_filter, &mut exit_status) {
-        Ok(pid) => {
-            if !_exit_status.is_null() {
-                unsafe {
-                    *_exit_status = exit_status;
-                }
-            }
-            Ok(pid as isize)
-        }
-        Err(e) => Err(e),
-    }
-}
+    let rand_buf = unsafe { std::slice::from_raw_parts_mut(buf, checked_len) };
+    let flags = RandFlags::from_bits(flags).ok_or_else(|| errno!(EINVAL, "invalid flags"))?;
 
-fn do_getpid() -> Result<isize> {
-    let pid = process::do_getpid();
-    Ok(pid as isize)
-}
-
-fn do_gettid() -> Result<isize> {
-    let tid = process::do_gettid();
-    Ok(tid as isize)
-}
-
-fn do_getppid() -> Result<isize> {
-    let ppid = process::do_getppid();
-    Ok(ppid as isize)
-}
-
-fn do_getpgid() -> Result<isize> {
-    let pgid = process::do_getpgid();
-    Ok(pgid as isize)
-}
-
-// TODO: implement uid, gid, euid, egid
-
-fn do_getuid() -> Result<isize> {
-    Ok(0)
-}
-
-fn do_getgid() -> Result<isize> {
-    Ok(0)
-}
-
-fn do_geteuid() -> Result<isize> {
-    Ok(0)
-}
-
-fn do_getegid() -> Result<isize> {
-    Ok(0)
-}
-
-fn do_pipe2(fds_u: *mut i32, flags: u32) -> Result<isize> {
-    check_mut_array(fds_u, 2)?;
-    // TODO: how to deal with open flags???
-    let fds = fs::do_pipe2(flags as u32)?;
-    unsafe {
-        *fds_u.offset(0) = fds[0] as c_int;
-        *fds_u.offset(1) = fds[1] as c_int;
-    }
-    Ok(0)
-}
-
-fn do_dup(old_fd: FileDesc) -> Result<isize> {
-    let new_fd = fs::do_dup(old_fd)?;
-    Ok(new_fd as isize)
-}
-
-fn do_dup2(old_fd: FileDesc, new_fd: FileDesc) -> Result<isize> {
-    let new_fd = fs::do_dup2(old_fd, new_fd)?;
-    Ok(new_fd as isize)
-}
-
-fn do_dup3(old_fd: FileDesc, new_fd: FileDesc, flags: u32) -> Result<isize> {
-    let new_fd = fs::do_dup3(old_fd, new_fd, flags)?;
-    Ok(new_fd as isize)
+    misc::do_getrandom(rand_buf, flags)?;
+    Ok(checked_len as isize)
 }
 
 // TODO: handle tz: timezone_t
@@ -812,596 +861,65 @@ fn do_clock_gettime(clockid: clockid_t, ts_u: *mut timespec_t) -> Result<isize> 
     Ok(0)
 }
 
-// FIXME: use this
-const MAP_FAILED: *const c_void = ((-1) as i64) as *const c_void;
-
-fn do_exit(status: i32) -> ! {
-    info!("exit: {}", status);
-    extern "C" {
-        fn do_exit_task() -> !;
-    }
-    process::do_exit(status);
-    unsafe {
-        do_exit_task();
-    }
-}
-
-fn do_unknown(
-    num: u32,
-    arg0: isize,
-    arg1: isize,
-    arg2: isize,
-    arg3: isize,
-    arg4: isize,
-    arg5: isize,
-) -> Result<isize> {
-    warn!(
-        "unknown or unsupported syscall (# = {}): {:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}",
-        num, arg0, arg1, arg2, arg3, arg4, arg5
-    );
-    return_errno!(ENOSYS, "Unknown syscall")
-}
-
-fn do_getcwd(buf: *mut u8, size: usize) -> Result<isize> {
-    let safe_buf = {
-        check_mut_array(buf, size)?;
-        unsafe { std::slice::from_raw_parts_mut(buf, size) }
-    };
-    let proc_ref = process::get_current();
-    let mut proc = proc_ref.lock().unwrap();
-    let cwd = proc.get_cwd();
-    if cwd.len() + 1 > safe_buf.len() {
-        return_errno!(ERANGE, "buf is not long enough");
-    }
-    safe_buf[..cwd.len()].copy_from_slice(cwd.as_bytes());
-    safe_buf[cwd.len()] = 0;
-    Ok(buf as isize)
-}
-
-fn do_chdir(path: *const i8) -> Result<isize> {
-    let path = clone_cstring_safely(path)?.to_string_lossy().into_owned();
-    fs::do_chdir(&path)?;
-    Ok(0)
-}
-
-fn do_rename(oldpath: *const i8, newpath: *const i8) -> Result<isize> {
-    let oldpath = clone_cstring_safely(oldpath)?
-        .to_string_lossy()
-        .into_owned();
-    let newpath = clone_cstring_safely(newpath)?
-        .to_string_lossy()
-        .into_owned();
-    fs::do_rename(&oldpath, &newpath)?;
-    Ok(0)
-}
-
-fn do_mkdir(path: *const i8, mode: usize) -> Result<isize> {
-    let path = clone_cstring_safely(path)?.to_string_lossy().into_owned();
-    fs::do_mkdir(&path, mode)?;
-    Ok(0)
-}
-
-fn do_rmdir(path: *const i8) -> Result<isize> {
-    let path = clone_cstring_safely(path)?.to_string_lossy().into_owned();
-    fs::do_rmdir(&path)?;
-    Ok(0)
-}
-
-fn do_link(oldpath: *const i8, newpath: *const i8) -> Result<isize> {
-    let oldpath = clone_cstring_safely(oldpath)?
-        .to_string_lossy()
-        .into_owned();
-    let newpath = clone_cstring_safely(newpath)?
-        .to_string_lossy()
-        .into_owned();
-    fs::do_link(&oldpath, &newpath)?;
-    Ok(0)
-}
-
-fn do_unlink(path: *const i8) -> Result<isize> {
-    let path = clone_cstring_safely(path)?.to_string_lossy().into_owned();
-    fs::do_unlink(&path)?;
-    Ok(0)
-}
-
-fn do_readlink(path: *const i8, buf: *mut u8, size: usize) -> Result<isize> {
-    let path = clone_cstring_safely(path)?.to_string_lossy().into_owned();
-    let buf = {
-        check_array(buf, size)?;
-        unsafe { std::slice::from_raw_parts_mut(buf, size) }
-    };
-    let len = fs::do_readlink(&path, buf)?;
-    Ok(len as isize)
-}
-
-fn do_sendfile(
-    out_fd: FileDesc,
-    in_fd: FileDesc,
-    offset_ptr: *mut off_t,
-    count: usize,
-) -> Result<isize> {
-    let offset = if offset_ptr.is_null() {
-        None
-    } else {
-        check_mut_ptr(offset_ptr)?;
-        Some(unsafe { offset_ptr.read() })
-    };
-
-    let (len, offset) = fs::do_sendfile(out_fd, in_fd, offset, count)?;
-    if !offset_ptr.is_null() {
+fn do_time(tloc_u: *mut time_t) -> Result<isize> {
+    let ts = time::do_clock_gettime(time::ClockID::CLOCK_REALTIME)?;
+    if !tloc_u.is_null() {
+        check_mut_ptr(tloc_u)?;
         unsafe {
-            offset_ptr.write(offset as off_t);
+            *tloc_u = ts.sec();
         }
     }
-    Ok(len as isize)
+    Ok(ts.sec() as isize)
 }
 
-fn do_fcntl(fd: FileDesc, cmd: u32, arg: u64) -> Result<isize> {
-    let cmd = FcntlCmd::from_raw(cmd, arg)?;
-    fs::do_fcntl(fd, &cmd)
-}
-
-fn do_ioctl(fd: FileDesc, cmd: c_int, argp: *mut c_int) -> Result<isize> {
-    info!("ioctl: fd: {}, cmd: {}, argp: {:?}", fd, cmd, argp);
-    let current_ref = process::get_current();
-    let mut proc = current_ref.lock().unwrap();
-    let file_ref = proc.get_files().lock().unwrap().get(fd as FileDesc)?;
-    if let Ok(socket) = file_ref.as_socket() {
-        let ret = try_libc!(libc::ocall::ioctl_arg1(socket.fd(), cmd, argp));
-        Ok(ret as isize)
-    } else if let Ok(unix_socket) = file_ref.as_unix_socket() {
-        // TODO: check argp
-        unix_socket.ioctl(cmd, argp)?;
-        Ok(0)
-    } else {
-        warn!("ioctl is unimplemented");
-        return_errno!(ENOSYS, "ioctl is unimplemented")
+fn do_clock_getres(clockid: clockid_t, res_u: *mut timespec_t) -> Result<isize> {
+    if res_u.is_null() {
+        return Ok(0);
     }
-}
-
-fn do_arch_prctl(code: u32, addr: *mut usize) -> Result<isize> {
-    let code = process::ArchPrctlCode::from_u32(code)?;
-    check_mut_ptr(addr)?;
-    process::do_arch_prctl(code, addr).map(|_| 0)
-}
-
-fn do_set_tid_address(tidptr: *mut pid_t) -> Result<isize> {
-    check_mut_ptr(tidptr)?;
-    process::do_set_tid_address(tidptr).map(|tid| tid as isize)
-}
-
-fn do_sched_getaffinity(pid: pid_t, cpusize: size_t, buf: *mut c_uchar) -> Result<isize> {
-    // Construct safe Rust types
-    let mut buf_slice = {
-        check_mut_array(buf, cpusize)?;
-        if cpusize == 0 {
-            return_errno!(EINVAL, "cpuset size must be greater than zero");
-        }
-        if buf as *const _ == std::ptr::null() {
-            return_errno!(EFAULT, "cpuset mask must NOT be null");
-        }
-        unsafe { std::slice::from_raw_parts_mut(buf, cpusize) }
-    };
-    // Call the memory-safe do_sched_getaffinity
-    let mut cpuset = CpuSet::new(cpusize);
-    let ret = process::do_sched_getaffinity(pid, &mut cpuset)?;
-    debug!("sched_getaffinity cpuset: {:#x}", cpuset);
-    // Copy from Rust types to C types
-    buf_slice.copy_from_slice(cpuset.as_slice());
-    Ok(ret as isize)
-}
-
-fn do_sched_setaffinity(pid: pid_t, cpusize: size_t, buf: *const c_uchar) -> Result<isize> {
-    // Convert unsafe C types into safe Rust types
-    let cpuset = {
-        check_array(buf, cpusize)?;
-        if cpusize == 0 {
-            return_errno!(EINVAL, "cpuset size must be greater than zero");
-        }
-        if buf as *const _ == std::ptr::null() {
-            return_errno!(EFAULT, "cpuset mask must NOT be null");
-        }
-        CpuSet::from_raw_buf(buf, cpusize)
-    };
-    debug!("sched_setaffinity cpuset: {:#x}", cpuset);
-    // Call the memory-safe do_sched_setaffinity
-    let ret = process::do_sched_setaffinity(pid, &cpuset)?;
-    Ok(ret as isize)
-}
-
-fn do_socket(domain: c_int, socket_type: c_int, protocol: c_int) -> Result<isize> {
-    info!(
-        "socket: domain: {}, socket_type: {}, protocol: {}",
-        domain, socket_type, protocol
-    );
-
-    let file_ref: Arc<Box<File>> = match domain {
-        libc::AF_LOCAL => {
-            let unix_socket = UnixSocketFile::new(socket_type, protocol)?;
-            Arc::new(Box::new(unix_socket))
-        }
-        _ => {
-            let socket = SocketFile::new(domain, socket_type, protocol)?;
-            Arc::new(Box::new(socket))
-        }
-    };
-
-    let current_ref = process::get_current();
-    let mut proc = current_ref.lock().unwrap();
-
-    let fd = proc.get_files().lock().unwrap().put(file_ref, false);
-    Ok(fd as isize)
-}
-
-fn do_connect(fd: c_int, addr: *const libc::sockaddr, addr_len: libc::socklen_t) -> Result<isize> {
-    info!(
-        "connect: fd: {}, addr: {:?}, addr_len: {}",
-        fd, addr, addr_len
-    );
-    let current_ref = process::get_current();
-    let mut proc = current_ref.lock().unwrap();
-    let file_ref = proc.get_files().lock().unwrap().get(fd as FileDesc)?;
-    if let Ok(socket) = file_ref.as_socket() {
-        let ret = try_libc!(libc::ocall::connect(socket.fd(), addr, addr_len));
-        Ok(ret as isize)
-    } else if let Ok(unix_socket) = file_ref.as_unix_socket() {
-        let addr = addr as *const libc::sockaddr_un;
-        check_ptr(addr)?; // TODO: check addr_len
-        let path = clone_cstring_safely(unsafe { (&*addr).sun_path.as_ptr() })?
-            .to_string_lossy()
-            .into_owned();
-        unix_socket.connect(path)?;
-        Ok(0)
-    } else {
-        return_errno!(EBADF, "not a socket")
+    check_mut_ptr(res_u)?;
+    let clockid = time::ClockID::from_raw(clockid)?;
+    let res = time::do_clock_getres(clockid)?;
+    unsafe {
+        *res_u = res;
     }
-}
-
-fn do_accept4(
-    fd: c_int,
-    addr: *mut libc::sockaddr,
-    addr_len: *mut libc::socklen_t,
-    flags: c_int,
-) -> Result<isize> {
-    info!(
-        "accept4: fd: {}, addr: {:?}, addr_len: {:?}, flags: {:#x}",
-        fd, addr, addr_len, flags
-    );
-    let current_ref = process::get_current();
-    let mut proc = current_ref.lock().unwrap();
-    let file_ref = proc.get_files().lock().unwrap().get(fd as FileDesc)?;
-    if let Ok(socket) = file_ref.as_socket() {
-        let socket = file_ref.as_socket()?;
-
-        let new_socket = socket.accept(addr, addr_len, flags)?;
-        let new_file_ref: Arc<Box<File>> = Arc::new(Box::new(new_socket));
-        let new_fd = proc.get_files().lock().unwrap().put(new_file_ref, false);
-
-        Ok(new_fd as isize)
-    } else if let Ok(unix_socket) = file_ref.as_unix_socket() {
-        let addr = addr as *mut libc::sockaddr_un;
-        check_mut_ptr(addr)?; // TODO: check addr_len
-
-        let new_socket = unix_socket.accept()?;
-        let new_file_ref: Arc<Box<File>> = Arc::new(Box::new(new_socket));
-        let new_fd = proc.get_files().lock().unwrap().put(new_file_ref, false);
-
-        Ok(new_fd as isize)
-    } else {
-        return_errno!(EBADF, "not a socket")
-    }
-}
-
-fn do_shutdown(fd: c_int, how: c_int) -> Result<isize> {
-    info!("shutdown: fd: {}, how: {}", fd, how);
-    let current_ref = process::get_current();
-    let mut proc = current_ref.lock().unwrap();
-    let file_ref = proc.get_files().lock().unwrap().get(fd as FileDesc)?;
-    if let Ok(socket) = file_ref.as_socket() {
-        let ret = try_libc!(libc::ocall::shutdown(socket.fd(), how));
-        Ok(ret as isize)
-    } else {
-        return_errno!(EBADF, "not a socket")
-    }
-}
-
-fn do_bind(fd: c_int, addr: *const libc::sockaddr, addr_len: libc::socklen_t) -> Result<isize> {
-    info!("bind: fd: {}, addr: {:?}, addr_len: {}", fd, addr, addr_len);
-    let current_ref = process::get_current();
-    let mut proc = current_ref.lock().unwrap();
-    let file_ref = proc.get_files().lock().unwrap().get(fd as FileDesc)?;
-    if let Ok(socket) = file_ref.as_socket() {
-        check_ptr(addr)?; // TODO: check addr_len
-        let ret = try_libc!(libc::ocall::bind(socket.fd(), addr, addr_len));
-        Ok(ret as isize)
-    } else if let Ok(unix_socket) = file_ref.as_unix_socket() {
-        let addr = addr as *const libc::sockaddr_un;
-        check_ptr(addr)?; // TODO: check addr_len
-        let path = clone_cstring_safely(unsafe { (&*addr).sun_path.as_ptr() })?
-            .to_string_lossy()
-            .into_owned();
-        unix_socket.bind(path)?;
-        Ok(0)
-    } else {
-        return_errno!(EBADF, "not a socket")
-    }
-}
-
-fn do_listen(fd: c_int, backlog: c_int) -> Result<isize> {
-    info!("listen: fd: {}, backlog: {}", fd, backlog);
-    let current_ref = process::get_current();
-    let mut proc = current_ref.lock().unwrap();
-    let file_ref = proc.get_files().lock().unwrap().get(fd as FileDesc)?;
-    if let Ok(socket) = file_ref.as_socket() {
-        let ret = try_libc!(libc::ocall::listen(socket.fd(), backlog));
-        Ok(ret as isize)
-    } else if let Ok(unix_socket) = file_ref.as_unix_socket() {
-        unix_socket.listen()?;
-        Ok(0)
-    } else {
-        return_errno!(EBADF, "not a socket")
-    }
-}
-
-fn do_setsockopt(
-    fd: c_int,
-    level: c_int,
-    optname: c_int,
-    optval: *const c_void,
-    optlen: libc::socklen_t,
-) -> Result<isize> {
-    info!(
-        "setsockopt: fd: {}, level: {}, optname: {}, optval: {:?}, optlen: {:?}",
-        fd, level, optname, optval, optlen
-    );
-    let current_ref = process::get_current();
-    let mut proc = current_ref.lock().unwrap();
-    let file_ref = proc.get_files().lock().unwrap().get(fd as FileDesc)?;
-    if let Ok(socket) = file_ref.as_socket() {
-        let ret = try_libc!(libc::ocall::setsockopt(
-            socket.fd(),
-            level,
-            optname,
-            optval,
-            optlen
-        ));
-        Ok(ret as isize)
-    } else if let Ok(unix_socket) = file_ref.as_unix_socket() {
-        warn!("setsockopt for unix socket is unimplemented");
-        Ok(0)
-    } else {
-        return_errno!(EBADF, "not a socket")
-    }
-}
-
-fn do_getsockopt(
-    fd: c_int,
-    level: c_int,
-    optname: c_int,
-    optval: *mut c_void,
-    optlen: *mut libc::socklen_t,
-) -> Result<isize> {
-    info!(
-        "getsockopt: fd: {}, level: {}, optname: {}, optval: {:?}, optlen: {:?}",
-        fd, level, optname, optval, optlen
-    );
-    let current_ref = process::get_current();
-    let mut proc = current_ref.lock().unwrap();
-    let file_ref = proc.get_files().lock().unwrap().get(fd as FileDesc)?;
-    let socket = file_ref.as_socket()?;
-
-    let ret = try_libc!(libc::ocall::getsockopt(
-        socket.fd(),
-        level,
-        optname,
-        optval,
-        optlen
-    ));
-    Ok(ret as isize)
-}
-
-fn do_getpeername(
-    fd: c_int,
-    addr: *mut libc::sockaddr,
-    addr_len: *mut libc::socklen_t,
-) -> Result<isize> {
-    info!(
-        "getpeername: fd: {}, addr: {:?}, addr_len: {:?}",
-        fd, addr, addr_len
-    );
-    let current_ref = process::get_current();
-    let mut proc = current_ref.lock().unwrap();
-    let file_ref = proc.get_files().lock().unwrap().get(fd as FileDesc)?;
-    if let Ok(socket) = file_ref.as_socket() {
-        let ret = try_libc!(libc::ocall::getpeername(socket.fd(), addr, addr_len));
-        Ok(ret as isize)
-    } else if let Ok(unix_socket) = file_ref.as_unix_socket() {
-        warn!("getpeername for unix socket is unimplemented");
-        return_errno!(
-            ENOTCONN,
-            "hack for php: Transport endpoint is not connected"
-        )
-    } else {
-        return_errno!(EBADF, "not a socket")
-    }
-}
-
-fn do_getsockname(
-    fd: c_int,
-    addr: *mut libc::sockaddr,
-    addr_len: *mut libc::socklen_t,
-) -> Result<isize> {
-    info!(
-        "getsockname: fd: {}, addr: {:?}, addr_len: {:?}",
-        fd, addr, addr_len
-    );
-    let current_ref = process::get_current();
-    let mut proc = current_ref.lock().unwrap();
-    let file_ref = proc.get_files().lock().unwrap().get(fd as FileDesc)?;
-    if let Ok(socket) = file_ref.as_socket() {
-        let ret = try_libc!(libc::ocall::getsockname(socket.fd(), addr, addr_len));
-        Ok(ret as isize)
-    } else if let Ok(unix_socket) = file_ref.as_unix_socket() {
-        warn!("getsockname for unix socket is unimplemented");
-        Ok(0)
-    } else {
-        return_errno!(EBADF, "not a socket")
-    }
-}
-
-fn do_sendto(
-    fd: c_int,
-    base: *const c_void,
-    len: size_t,
-    flags: c_int,
-    addr: *const libc::sockaddr,
-    addr_len: libc::socklen_t,
-) -> Result<isize> {
-    info!(
-        "sendto: fd: {}, base: {:?}, len: {}, addr: {:?}, addr_len: {}",
-        fd, base, len, addr, addr_len
-    );
-    let current_ref = process::get_current();
-    let mut proc = current_ref.lock().unwrap();
-    let file_ref = proc.get_files().lock().unwrap().get(fd as FileDesc)?;
-    let socket = file_ref.as_socket()?;
-
-    let ret = try_libc!(libc::ocall::sendto(
-        socket.fd(),
-        base,
-        len,
-        flags,
-        addr,
-        addr_len
-    ));
-    Ok(ret as isize)
-}
-
-fn do_recvfrom(
-    fd: c_int,
-    base: *mut c_void,
-    len: size_t,
-    flags: c_int,
-    addr: *mut libc::sockaddr,
-    addr_len: *mut libc::socklen_t,
-) -> Result<isize> {
-    info!(
-        "recvfrom: fd: {}, base: {:?}, len: {}, flags: {}, addr: {:?}, addr_len: {:?}",
-        fd, base, len, flags, addr, addr_len
-    );
-    let current_ref = process::get_current();
-    let mut proc = current_ref.lock().unwrap();
-    let file_ref = proc.get_files().lock().unwrap().get(fd as FileDesc)?;
-    let socket = file_ref.as_socket()?;
-
-    let ret = try_libc!(libc::ocall::recvfrom(
-        socket.fd(),
-        base,
-        len,
-        flags,
-        addr,
-        addr_len
-    ));
-    Ok(ret as isize)
-}
-
-fn do_select(
-    nfds: c_int,
-    readfds: *mut libc::fd_set,
-    writefds: *mut libc::fd_set,
-    exceptfds: *mut libc::fd_set,
-    timeout: *const libc::timeval,
-) -> Result<isize> {
-    // check arguments
-    if nfds < 0 || nfds >= libc::FD_SETSIZE as c_int {
-        return_errno!(EINVAL, "nfds is negative or exceeds the resource limit");
-    }
-    let nfds = nfds as usize;
-
-    let mut zero_fds0: libc::fd_set = unsafe { core::mem::zeroed() };
-    let mut zero_fds1: libc::fd_set = unsafe { core::mem::zeroed() };
-    let mut zero_fds2: libc::fd_set = unsafe { core::mem::zeroed() };
-
-    let readfds = if !readfds.is_null() {
-        check_mut_ptr(readfds)?;
-        unsafe { &mut *readfds }
-    } else {
-        &mut zero_fds0
-    };
-    let writefds = if !writefds.is_null() {
-        check_mut_ptr(writefds)?;
-        unsafe { &mut *writefds }
-    } else {
-        &mut zero_fds1
-    };
-    let exceptfds = if !exceptfds.is_null() {
-        check_mut_ptr(exceptfds)?;
-        unsafe { &mut *exceptfds }
-    } else {
-        &mut zero_fds2
-    };
-    let timeout = if !timeout.is_null() {
-        check_ptr(timeout)?;
-        Some(unsafe { timeout.read() })
-    } else {
-        None
-    };
-
-    let n = fs::do_select(nfds, readfds, writefds, exceptfds, timeout)?;
-    Ok(n as isize)
-}
-
-fn do_poll(fds: *mut libc::pollfd, nfds: libc::nfds_t, timeout: c_int) -> Result<isize> {
-    check_mut_array(fds, nfds as usize)?;
-    let polls = unsafe { std::slice::from_raw_parts_mut(fds, nfds as usize) };
-
-    let n = fs::do_poll(polls, timeout)?;
-    Ok(n as isize)
-}
-
-fn do_epoll_create(size: c_int) -> Result<isize> {
-    if size <= 0 {
-        return_errno!(EINVAL, "size is not positive");
-    }
-    do_epoll_create1(0)
-}
-
-fn do_epoll_create1(flags: c_int) -> Result<isize> {
-    let fd = fs::do_epoll_create1(flags)?;
-    Ok(fd as isize)
-}
-
-fn do_epoll_ctl(
-    epfd: c_int,
-    op: c_int,
-    fd: c_int,
-    event: *const libc::epoll_event,
-) -> Result<isize> {
-    if !event.is_null() {
-        check_ptr(event)?;
-    }
-    fs::do_epoll_ctl(epfd as FileDesc, op, fd as FileDesc, event)?;
     Ok(0)
 }
 
-fn do_epoll_wait(
-    epfd: c_int,
-    events: *mut libc::epoll_event,
-    maxevents: c_int,
-    timeout: c_int,
+fn do_clock_nanosleep(
+    clockid: clockid_t,
+    flags: i32,
+    req_u: *const timespec_t,
+    rem_u: *mut timespec_t,
 ) -> Result<isize> {
-    let maxevents = {
-        if maxevents <= 0 {
-            return_errno!(EINVAL, "maxevents <= 0");
-        }
-        maxevents as usize
+    let req = {
+        check_ptr(req_u)?;
+        timespec_t::from_raw_ptr(req_u)?
     };
-    let events = {
-        check_mut_array(events, maxevents)?;
-        unsafe { std::slice::from_raw_parts_mut(events, maxevents) }
+    let rem = if !rem_u.is_null() {
+        check_mut_ptr(rem_u)?;
+        Some(unsafe { &mut *rem_u })
+    } else {
+        None
     };
-    let count = fs::do_epoll_wait(epfd as FileDesc, events, timeout)?;
-    Ok(count as isize)
+    let clockid = time::ClockID::from_raw(clockid)?;
+    time::do_clock_nanosleep(clockid, flags, &req, rem)?;
+    Ok(0)
+}
+
+// TODO: handle remainder
+fn do_nanosleep(req_u: *const timespec_t, rem_u: *mut timespec_t) -> Result<isize> {
+    let req = {
+        check_ptr(req_u)?;
+        timespec_t::from_raw_ptr(req_u)?
+    };
+    let rem = if !rem_u.is_null() {
+        check_mut_ptr(rem_u)?;
+        Some(unsafe { &mut *rem_u })
+    } else {
+        None
+    };
+    time::do_nanosleep(&req, rem)?;
+    Ok(0)
 }
 
 fn do_uname(name: *mut utsname_t) -> Result<isize> {
@@ -1436,32 +954,126 @@ fn do_prlimit(
     misc::do_prlimit(pid, resource, new_limit, old_limit).map(|_| 0)
 }
 
-fn do_access(path: *const i8, mode: u32) -> Result<isize> {
-    let path = clone_cstring_safely(path)?.to_string_lossy().into_owned();
-    let mode = AccessModes::from_u32(mode)?;
-    fs::do_access(&path, mode).map(|_| 0)
+fn handle_unsupported() -> Result<isize> {
+    return_errno!(ENOSYS, "Unimplemented or unknown syscall")
 }
 
-fn do_faccessat(dirfd: i32, path: *const i8, mode: u32, flags: u32) -> Result<isize> {
-    let dirfd = if dirfd >= 0 {
-        Some(dirfd as FileDesc)
-    } else if dirfd == AT_FDCWD {
-        None
-    } else {
-        return_errno!(EINVAL, "invalid dirfd");
-    };
-    let path = clone_cstring_safely(path)?.to_string_lossy().into_owned();
-    let mode = AccessModes::from_u32(mode)?;
-    let flags = AccessFlags::from_u32(flags)?;
-    fs::do_faccessat(dirfd, &path, mode, flags).map(|_| 0)
+/// Floating point registers
+///
+/// Note. The area is used to save fxsave result
+//#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct FpRegs {
+    inner: Aligned<A16, [u8; 512]>,
 }
 
-// TODO: implement signals
+impl FpRegs {
+    /// Save the current CPU floating pointer states to an instance of FpRegs
+    pub fn save() -> Self {
+        let mut fpregs = MaybeUninit::<Self>::uninit();
+        unsafe {
+            _fxsave(fpregs.as_mut_ptr() as *mut u8);
+            fpregs.assume_init()
+        }
+    }
 
-fn do_rt_sigaction() -> Result<isize> {
-    Ok(0)
+    /// Restore the current CPU floating pointer states from this FpRegs instance
+    pub fn restore(&self) {
+        unsafe { _fxrstor(self.inner.as_ptr()) };
+    }
+
+    /// Construct a FpRegs from a slice of u8.
+    ///
+    /// It is up to the caller to ensure that the src slice contains data that
+    /// is the xsave/xrstor format.
+    pub unsafe fn from_slice(src: &[u8]) -> Self {
+        let mut uninit = MaybeUninit::<Self>::uninit();
+        let dst_buf: &mut [u8] = std::slice::from_raw_parts_mut(
+            uninit.as_mut_ptr() as *mut u8,
+            std::mem::size_of::<FpRegs>(),
+        );
+        dst_buf.copy_from_slice(&src);
+        uninit.assume_init()
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        self.inner.as_ref()
+    }
 }
 
-fn do_rt_sigprocmask() -> Result<isize> {
-    Ok(0)
+/// Cpu context.
+///
+/// Note. The definition of this struct must be kept in sync with the assembly
+/// code in `syscall_entry_x86-64.S`.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct CpuContext {
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rbp: u64,
+    pub rbx: u64,
+    pub rdx: u64,
+    pub rax: u64,
+    pub rcx: u64,
+    pub rsp: u64,
+    pub rip: u64,
+    pub rflags: u64,
+    pub fpregs_on_heap: u64,
+    pub fpregs: *mut FpRegs,
+}
+
+impl CpuContext {
+    pub fn from_sgx(src: &sgx_cpu_context_t) -> CpuContext {
+        Self {
+            r8: src.r8,
+            r9: src.r9,
+            r10: src.r10,
+            r11: src.r11,
+            r12: src.r12,
+            r13: src.r13,
+            r14: src.r14,
+            r15: src.r15,
+            rdi: src.rdi,
+            rsi: src.rsi,
+            rbp: src.rbp,
+            rbx: src.rbx,
+            rdx: src.rdx,
+            rax: src.rax,
+            rcx: src.rcx,
+            rsp: src.rsp,
+            rip: src.rip,
+            rflags: src.rflags,
+            fpregs_on_heap: 0,
+            fpregs: ptr::null_mut(),
+        }
+    }
+}
+
+// exception and interrupt syscalls share the same c abi
+//
+// num: occlum syscall number
+// info: pointer to sgx_exception_info_t or sgx_interrupt_info_t
+// fpregs: pointer to FpRegs. Rust compiler would complain about passing
+//  to external C functions a CpuContext pointer, which includes a FpRegs
+//  pointer that is not safe to use by external modules. In our case, the
+//  FpRegs pointer will not be used actually. So the Rust warning is a
+//  false alarm. We suppress it here.
+pub unsafe fn exception_interrupt_syscall_c_abi(
+    num: u32,
+    info: *mut c_void,
+    fpregs: *mut FpRegs,
+) -> u32 {
+    #[allow(improper_ctypes)]
+    extern "C" {
+        pub fn __occlum_syscall_c_abi(num: u32, info: *mut c_void, fpregs: *mut FpRegs) -> u32;
+    }
+    __occlum_syscall_c_abi(num, info, fpregs)
 }

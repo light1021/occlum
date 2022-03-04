@@ -1,13 +1,28 @@
+use self::timer_slack::*;
+use super::*;
+use core::convert::TryFrom;
+use process::pid_t;
 use rcore_fs::dev::TimeProvider;
 use rcore_fs::vfs::Timespec;
+use std::time::Duration;
+use std::{fmt, u64};
+use syscall::SyscallNum;
 
-use super::*;
+mod profiler;
+pub mod timer_slack;
+pub mod up_time;
+
+pub use profiler::ThreadProfiler;
+pub use timer_slack::TIMERSLACK;
 
 #[allow(non_camel_case_types)]
 pub type time_t = i64;
 
 #[allow(non_camel_case_types)]
 pub type suseconds_t = i64;
+
+#[allow(non_camel_case_types)]
+pub type clock_t = i64;
 
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
@@ -18,21 +33,46 @@ pub struct timeval_t {
 }
 
 impl timeval_t {
-    pub fn as_usec(&self) -> usize {
-        (self.sec * 1000000 + self.usec) as usize
+    pub fn new(sec: time_t, usec: suseconds_t) -> Self {
+        let time = Self { sec, usec };
+
+        time.validate().unwrap();
+        time
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.sec >= 0 && self.usec >= 0 && self.usec < 1_000_000 {
+            Ok(())
+        } else {
+            return_errno!(EINVAL, "invalid value for timeval_t");
+        }
+    }
+
+    pub fn as_duration(&self) -> Duration {
+        Duration::new(self.sec as u64, (self.usec * 1_000) as u32)
+    }
+}
+
+impl From<Duration> for timeval_t {
+    fn from(duration: Duration) -> timeval_t {
+        let sec = duration.as_secs() as time_t;
+        let usec = duration.subsec_micros() as i64;
+        debug_assert!(sec >= 0); // nsec >= 0 always holds
+        timeval_t { sec, usec }
     }
 }
 
 pub fn do_gettimeofday() -> timeval_t {
+    extern "C" {
+        fn occlum_ocall_gettimeofday(tv: *mut timeval_t) -> sgx_status_t;
+    }
+
     let mut tv: timeval_t = Default::default();
     unsafe {
-        ocall_gettimeofday(&mut tv.sec as *mut time_t, &mut tv.usec as *mut suseconds_t);
+        occlum_ocall_gettimeofday(&mut tv as *mut timeval_t);
     }
+    tv.validate().expect("ocall returned invalid timeval_t");
     tv
-}
-
-extern "C" {
-    fn ocall_gettimeofday(sec: *mut time_t, usec: *mut suseconds_t) -> sgx_status_t;
 }
 
 #[repr(C)]
@@ -41,6 +81,43 @@ extern "C" {
 pub struct timespec_t {
     sec: time_t,
     nsec: i64,
+}
+
+impl From<Duration> for timespec_t {
+    fn from(duration: Duration) -> timespec_t {
+        let sec = duration.as_secs() as time_t;
+        let nsec = duration.subsec_nanos() as i64;
+        debug_assert!(sec >= 0); // nsec >= 0 always holds
+        timespec_t { sec, nsec }
+    }
+}
+
+impl timespec_t {
+    pub fn from_raw_ptr(ptr: *const timespec_t) -> Result<timespec_t> {
+        let ts = unsafe { *ptr };
+        ts.validate()?;
+        Ok(ts)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.sec >= 0 && self.nsec >= 0 && self.nsec < 1_000_000_000 {
+            Ok(())
+        } else {
+            return_errno!(EINVAL, "invalid value for timespec_t");
+        }
+    }
+
+    pub fn sec(&self) -> time_t {
+        self.sec
+    }
+
+    pub fn nsec(&self) -> i64 {
+        self.nsec
+    }
+
+    pub fn as_duration(&self) -> Duration {
+        Duration::new(self.sec as u64, self.nsec as u32)
+    }
 }
 
 #[allow(non_camel_case_types)]
@@ -77,24 +154,127 @@ impl ClockID {
 }
 
 pub fn do_clock_gettime(clockid: ClockID) -> Result<timespec_t> {
-    let mut sec = 0;
-    let mut nsec = 0;
-    unsafe {
-        ocall_clock_gettime(
-            clockid as clockid_t,
-            &mut sec as *mut time_t,
-            &mut nsec as *mut i64,
-        );
+    extern "C" {
+        fn occlum_ocall_clock_gettime(clockid: clockid_t, tp: *mut timespec_t) -> sgx_status_t;
     }
-    Ok(timespec_t { sec, nsec })
+
+    let mut tv: timespec_t = Default::default();
+    unsafe {
+        occlum_ocall_clock_gettime(clockid as clockid_t, &mut tv as *mut timespec_t);
+    }
+    tv.validate().expect("ocall returned invalid timespec");
+    Ok(tv)
 }
 
-extern "C" {
-    fn ocall_clock_gettime(clockid: clockid_t, sec: *mut time_t, ns: *mut i64) -> sgx_status_t;
+pub fn do_clock_getres(clockid: ClockID) -> Result<timespec_t> {
+    extern "C" {
+        fn occlum_ocall_clock_getres(clockid: clockid_t, res: *mut timespec_t) -> sgx_status_t;
+    }
+
+    let mut res: timespec_t = Default::default();
+    unsafe {
+        occlum_ocall_clock_getres(clockid as clockid_t, &mut res as *mut timespec_t);
+    }
+    let validate_resolution = |res: &timespec_t| -> Result<()> {
+        // The resolution can be ranged from 1 nanosecond to a few milliseconds
+        if res.sec == 0 && res.nsec > 0 && res.nsec < 1_000_000_000 {
+            Ok(())
+        } else {
+            return_errno!(EINVAL, "invalid value for resolution");
+        }
+    };
+    // do sanity check
+    validate_resolution(&res).expect("ocall returned invalid resolution");
+    Ok(res)
+}
+
+const TIMER_ABSTIME: i32 = 0x01;
+
+pub fn do_clock_nanosleep(
+    clockid: ClockID,
+    flags: i32,
+    req: &timespec_t,
+    rem: Option<&mut timespec_t>,
+) -> Result<()> {
+    extern "C" {
+        fn occlum_ocall_clock_nanosleep(
+            ret: *mut i32,
+            clockid: clockid_t,
+            flags: i32,
+            req: *const timespec_t,
+            rem: *mut timespec_t,
+        ) -> sgx_status_t;
+    }
+
+    let mut ret = 0;
+    let mut u_rem: timespec_t = timespec_t { sec: 0, nsec: 0 };
+    match clockid {
+        ClockID::CLOCK_REALTIME
+        | ClockID::CLOCK_MONOTONIC
+        | ClockID::CLOCK_BOOTTIME
+        | ClockID::CLOCK_PROCESS_CPUTIME_ID => {}
+        ClockID::CLOCK_THREAD_CPUTIME_ID => {
+            return_errno!(EINVAL, "CLOCK_THREAD_CPUTIME_ID is not a permitted value");
+        }
+        _ => {
+            return_errno!(EOPNOTSUPP, "does not support sleeping against this clockid");
+        }
+    }
+    let sgx_status = unsafe {
+        occlum_ocall_clock_nanosleep(&mut ret, clockid as clockid_t, flags, req, &mut u_rem)
+    };
+    assert!(sgx_status == sgx_status_t::SGX_SUCCESS);
+    assert!(ret == 0 || ret == Errno::EINTR as i32);
+    if ret != 0 {
+        assert!(u_rem.as_duration() <= req.as_duration() + (*TIMERSLACK).to_duration());
+        // rem is only valid if TIMER_ABSTIME flag is not set
+        if flags != TIMER_ABSTIME {
+            if let Some(rem) = rem {
+                *rem = u_rem;
+            }
+        }
+        return_errno!(EINTR, "sleep interrupted");
+    }
+    return Ok(());
+}
+
+pub fn do_nanosleep(req: &timespec_t, rem: Option<&mut timespec_t>) -> Result<()> {
+    // POSIX.1 specifies that nanosleep() should measure time against
+    // the CLOCK_REALTIME clock.  However, Linux measures the time using
+    // the CLOCK_MONOTONIC clock.
+    // Here we follow the POSIX.1
+    let clock_id = ClockID::CLOCK_REALTIME;
+    return do_clock_nanosleep(clock_id, 0, req, rem);
+}
+
+pub fn do_thread_getcpuclock() -> Result<timespec_t> {
+    extern "C" {
+        fn occlum_ocall_thread_getcpuclock(ret: *mut c_int, tp: *mut timespec_t) -> sgx_status_t;
+    }
+
+    let mut tv: timespec_t = Default::default();
+    try_libc!({
+        let mut retval: i32 = 0;
+        let status = occlum_ocall_thread_getcpuclock(&mut retval, &mut tv as *mut timespec_t);
+        assert!(status == sgx_status_t::SGX_SUCCESS);
+        retval
+    });
+    tv.validate()?;
+    Ok(tv)
+}
+
+pub fn do_rdtsc() -> (u32, u32) {
+    extern "C" {
+        fn occlum_ocall_rdtsc(low: *mut u32, high: *mut u32) -> sgx_status_t;
+    }
+    let mut low = 0;
+    let mut high = 0;
+    let sgx_status = unsafe { occlum_ocall_rdtsc(&mut low, &mut high) };
+    assert!(sgx_status == sgx_status_t::SGX_SUCCESS);
+    (low, high)
 }
 
 // For SEFS
-
 pub struct OcclumTimeProvider;
 
 impl TimeProvider for OcclumTimeProvider {
@@ -102,7 +282,29 @@ impl TimeProvider for OcclumTimeProvider {
         let time = do_gettimeofday();
         Timespec {
             sec: time.sec,
-            nsec: time.usec as i32 * 1000,
+            nsec: time.usec * 1000,
         }
+    }
+}
+
+// For Timerfd
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+#[allow(non_camel_case_types)]
+pub struct itimerspec_t {
+    it_interval: timespec_t,
+    it_value: timespec_t,
+}
+
+impl itimerspec_t {
+    pub fn from_raw_ptr(ptr: *const itimerspec_t) -> Result<itimerspec_t> {
+        let its = unsafe { *ptr };
+        its.validate()?;
+        Ok(its)
+    }
+    pub fn validate(&self) -> Result<()> {
+        self.it_interval.validate()?;
+        self.it_value.validate()?;
+        Ok(())
     }
 }

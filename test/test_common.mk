@@ -2,8 +2,10 @@ MAIN_MAKEFILE := $(firstword $(MAKEFILE_LIST))
 INCLUDE_MAKEFILE := $(lastword $(MAKEFILE_LIST))
 CUR_DIR := $(shell dirname $(realpath $(MAIN_MAKEFILE)))
 PROJECT_DIR := $(realpath $(CUR_DIR)/../../)
-BUILD_DIR := $(PROJECT_DIR)/build
+SGX_MODE ?= HW
+EXTRA_ENV :=
 
+BUILD_DIR := $(PROJECT_DIR)/build
 TEST_NAME := $(shell basename $(CUR_DIR))
 IMAGE_DIR := $(BUILD_DIR)/test/image
 BIN := $(IMAGE_DIR)/bin/$(TEST_NAME)
@@ -15,10 +17,22 @@ CXX_OBJS := $(addprefix $(BUILD_DIR)/test/obj/$(TEST_NAME)/,$(CXX_SRCS:%.cc=%.o)
 
 ALL_BUILD_SUBDIRS := $(sort $(patsubst %/,%,$(dir $(BIN) $(C_OBJS) $(CXX_OBJS))))
 
-CC := occlum-gcc
-CXX := occlum-g++
+ifeq ($(OCCLUM_TEST_GLIBC), 1)
+	CC = gcc
+	CXX = g++
+else
+	CC = occlum-gcc
+	CXX = occlum-g++
+endif
 
 C_FLAGS = -Wall -Wno-return-local-addr -I../include -O2 -fPIC $(EXTRA_C_FLAGS)
+ifeq ($(SGX_MODE), SIM)
+	C_FLAGS += -D SGX_MODE_SIM
+else ifeq ($(SGX_MODE), SW)
+	C_FLAGS += -D SGX_MODE_SIM
+else
+	C_FLAGS += -D SGX_MODE_HW
+endif
 LINK_FLAGS = $(C_FLAGS) -pie $(EXTRA_LINK_FLAGS)
 
 .PHONY: all test test-native clean
@@ -58,7 +72,7 @@ $(BUILD_DIR)/test/obj/$(TEST_NAME)/%.o: %.cc
 
 test:
 	@cd $(BUILD_DIR)/test && \
-		$(PROJECT_DIR)/build/bin/occlum run /bin/$(TEST_NAME) $(BIN_ARGS)
+		$(EXTRA_ENV) $(BUILD_DIR)/bin/occlum exec /bin/$(TEST_NAME) $(BIN_ARGS)
 
 test-native:
 	@LD_LIBRARY_PATH=/usr/local/occlum/lib cd $(IMAGE_DIR) && ./bin/$(TEST_NAME) $(BIN_ARGS)

@@ -1,84 +1,79 @@
-pub use self::arch_prctl::{do_arch_prctl, ArchPrctlCode};
-pub use self::exit::{do_exit, do_wait4, ChildProcessFilter};
-pub use self::futex::{futex_op_and_flags_from_u32, futex_wait, futex_wake, FutexFlags, FutexOp};
-pub use self::process::{Status, IDLE_PROCESS};
-pub use self::process_table::get;
-pub use self::sched::{do_sched_getaffinity, do_sched_setaffinity, CpuSet};
-pub use self::spawn::{do_spawn, FileAction};
-pub use self::task::{current_pid, get_current, run_task};
-pub use self::thread::{do_clone, do_set_tid_address, CloneFlags, ThreadGroup};
-pub use self::wait::{WaitQueue, Waiter};
+/// Process/thread subsystem.
+///
+/// The subsystem implements process/thread-related system calls, which are
+/// mainly based on the three concepts below:
+///
+/// * [`Process`]. A process has a parent and may have multiple child processes and
+/// can own multiple threads.
+/// * [`Thread`]. A thread belongs to one and only one process and owns a set
+/// of OS resources, e.g., virtual memory, file tables, etc.
+/// * [`Task`]. A task belongs to one and only one thread, for which it deals with
+/// the low-level details about thread execution.
+use crate::fs::{FileRef, FileTable, FsView};
+use crate::misc::ResourceLimits;
+use crate::prelude::*;
+use crate::sched::SchedAgent;
+use crate::signal::{SigDispositions, SigQueues};
+use crate::vm::ProcessVM;
 
-#[allow(non_camel_case_types)]
-pub type pid_t = u32;
+use self::pgrp::ProcessGrp;
+use self::process::{ProcessBuilder, ProcessInner};
+use self::thread::{ThreadBuilder, ThreadId, ThreadInner};
+use self::wait::{WaitQueue, Waiter};
 
-#[derive(Debug)]
-pub struct Process {
-    task: Task,
-    status: Status,
-    pid: pid_t,
-    pgid: pid_t,
-    tgid: pid_t,
-    host_tid: pid_t,
-    exit_status: i32,
-    // TODO: move cwd, root_inode into a FileSystem structure
-    // TODO: should cwd be a String or INode?
-    cwd: String,
-    clear_child_tid: Option<*mut pid_t>,
-    parent: Option<ProcessRef>,
-    children: Vec<ProcessWeakRef>,
-    waiting_children: Option<WaitQueue<ChildProcessFilter, pid_t>>,
-    vm: ProcessVMRef,
-    file_table: FileTableRef,
-    rlimits: ResourceLimitsRef,
-}
+pub use self::do_exit::handle_force_exit;
+pub use self::do_futex::{futex_wait, futex_wake};
+pub use self::do_robust_list::RobustListHead;
+pub use self::do_spawn::do_spawn_without_exec;
+pub use self::do_vfork::do_vfork;
+pub use self::do_wait4::idle_reap_zombie_children;
+pub use self::process::{Process, ProcessFilter, ProcessStatus, IDLE};
+pub use self::spawn_attribute::posix_spawnattr_t;
+pub use self::spawn_attribute::SpawnAttr;
+pub use self::syscalls::*;
+pub use self::task::Task;
+pub use self::term_status::{ForcedExitStatus, TermStatus};
+pub use self::thread::{Thread, ThreadStatus};
 
-pub type ProcessRef = Arc<SgxMutex<Process>>;
-pub type ProcessWeakRef = std::sync::Weak<SgxMutex<Process>>;
-pub type FileTableRef = Arc<SgxMutex<FileTable>>;
-pub type ProcessVMRef = Arc<SgxMutex<ProcessVM>>;
-
-pub fn do_getpid() -> pid_t {
-    let current_ref = get_current();
-    let current = current_ref.lock().unwrap();
-    current.get_pid()
-}
-
-pub fn do_gettid() -> pid_t {
-    let current_ref = get_current();
-    let current = current_ref.lock().unwrap();
-    current.get_tid()
-}
-
-pub fn do_getpgid() -> pid_t {
-    let current_ref = get_current();
-    let current = current_ref.lock().unwrap();
-    current.get_pgid()
-}
-
-pub fn do_getppid() -> pid_t {
-    let parent_ref = {
-        let current_ref = get_current();
-        let current = current_ref.lock().unwrap();
-        current.get_parent().clone()
-    };
-    let parent = parent_ref.lock().unwrap();
-    parent.get_pid()
-}
-
-mod arch_prctl;
-mod exit;
-mod futex;
+mod do_arch_prctl;
+mod do_clone;
+mod do_exec;
+mod do_exit;
+mod do_futex;
+mod do_getpid;
+mod do_robust_list;
+mod do_set_tid_address;
+mod do_spawn;
+mod do_vfork;
+mod do_wait4;
+mod pgrp;
+mod prctl;
 mod process;
-mod process_table;
-mod sched;
-mod spawn;
-mod task;
+mod spawn_attribute;
+mod syscalls;
+mod term_status;
 mod thread;
 mod wait;
 
-use self::task::Task;
-use super::*;
-use fs::{File, FileRef, FileTable};
-use misc::ResourceLimitsRef;
-use vm::ProcessVM;
+pub mod current;
+pub mod elf_file;
+pub mod table;
+pub mod task;
+
+// TODO: need to separate C's version pid_t with Rust version Pid.
+// pid_t must be signed as negative values may have special meaning
+// (check wait4 and kill for examples), while Pid should be a
+// non-negative value.
+#[allow(non_camel_case_types)]
+pub type pid_t = u32;
+#[allow(non_camel_case_types)]
+pub type uid_t = u32;
+
+pub type ProcessRef = Arc<Process>;
+pub type ThreadRef = Arc<Thread>;
+pub type FileTableRef = Arc<SgxMutex<FileTable>>;
+pub type ProcessVMRef = Arc<ProcessVM>;
+pub type FsViewRef = Arc<RwLock<FsView>>;
+pub type SchedAgentRef = Arc<SgxMutex<SchedAgent>>;
+pub type ResourceLimitsRef = Arc<SgxMutex<ResourceLimits>>;
+pub type ProcessGrpRef = Arc<ProcessGrp>;

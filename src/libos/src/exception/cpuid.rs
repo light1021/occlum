@@ -1,13 +1,12 @@
 use super::*;
+use crate::syscall::CpuContext;
 use sgx_types::*;
 use std::collections::HashMap;
 use std::rsgx_cpuidex;
 
-const CPUID_OPCODE: u16 = 0xA20F;
+pub const CPUID_OPCODE: u16 = 0xA20F;
 const CPUID_MIN_BASIC_LEAF: u32 = 0;
-const CPUID_MAX_BASIC_LEAF: u32 = 0x17;
 const CPUID_MIN_EXTEND_LEAF: u32 = 0x8000_0000;
-const CPUID_MAX_EXTEND_LEAF: u32 = 0x8000_0008;
 const CPUID_MAX_SUBLEAF: u32 = u32::max_value();
 
 #[repr(C)]
@@ -18,7 +17,7 @@ struct CpuIdInput {
 }
 
 #[repr(C)]
-#[derive(Eq, PartialEq, Hash, Clone, Copy)]
+#[derive(Eq, PartialEq, Hash, Clone, Copy, Debug)]
 struct CpuIdResult {
     eax: u32,
     ebx: u32,
@@ -75,19 +74,21 @@ impl CpuIdCache {
                 if subleaf == 0 {
                     max_subleaf = match leaf {
                         // EAX Bits 31 - 00: Reports the maximum sub-leaf supported.
-                        0x7 | 0x14 | 0x17 => cpuid_result.eax,
+                        0x7 | 0x14 | 0x17 | 0x18 => cpuid_result.eax,
                         // Reports valid resource type starting at bit position 1 of EDX.
                         // EDX Bit 00: Reserved.
                         //     Bit 01: Supports L3 Cache Intel RDT Monitoring if 1.
                         //     Bits 31 - 02: Reserved.
-                        0xF => cpuid_result.edx & 0x0000_0002 >> 1,
+                        0xF => (cpuid_result.edx & 0x0000_0002) >> 1,
                         // Reports valid ResID starting at bit position 1 of EBX.
                         // EBX Bit 00: Reserved.
                         //     Bit 01: Supports L3 Cache Allocation Technology if 1.
                         //     Bit 02: Supports L2 Cache Allocation Technology if 1.
-                        //     Bits 31 - 03: Reserved.
-                        0x10 => match cpuid_result.ebx & 0x0000_0006 {
-                            0x0000_0006 => 2,
+                        //     Bit 03: Supports Memory Bandwidth Allocation if 1.
+                        //     Bits 31 - 04: Reserved.
+                        0x10 => match cpuid_result.ebx & 0x0000_000E {
+                            0x0000_0008 | 0x0000_000A | 0x0000_000C | 0x0000_000E => 3,
+                            0x0000_0004 | 0x0000_0006 => 2,
                             0x0000_0002 => 1,
                             _ => 0,
                         },
@@ -95,7 +96,7 @@ impl CpuIdCache {
                         0xD => 63,
                         // (Sub-leaf == 0) can not decide max_subleaf for these leaf,
                         // later match expression will decide the max_subleaf.
-                        0x4 | 0xB | 0x12 => CPUID_MAX_SUBLEAF,
+                        0x4 | 0xB | 0x12 | 0x1F => CPUID_MAX_SUBLEAF,
                         // Default max_subleaf is 0.
                         _ => 0,
                     };
@@ -119,6 +120,9 @@ impl CpuIdCache {
                         // EAX Bit 03 - 00: Sub-leaf Type.
                         //         0000b: Indicates this sub-leaf is invalid.
                         0x12 if subleaf >= 2 && (cpuid_result.eax & 0x0000000F) == 0 => subleaf,
+                        // V2 Extended Topology Enumeration Leaf
+                        // CPUID leaf 0x1F is a preferred superset to leaf 0xB.
+                        0x1F if (cpuid_result.ecx & 0x0000_FF00) == 0 => subleaf,
                         // Condition not met.
                         _ => max_subleaf,
                     };
@@ -140,23 +144,11 @@ impl CpuIdCache {
 impl CpuId {
     pub fn new() -> CpuId {
         let max_basic_leaf = match rsgx_cpuidex(CPUID_MIN_BASIC_LEAF as i32, 0) {
-            Ok(sgx_cpuinfo) => {
-                if is_valid_cpuid_basic_leaf(sgx_cpuinfo[0] as u32) {
-                    sgx_cpuinfo[0] as u32
-                } else {
-                    panic!("invalid basic cpuid_level")
-                }
-            }
+            Ok(sgx_cpuinfo) => sgx_cpuinfo[0] as u32,
             _ => panic!("failed to call sgx_cpuidex"),
         };
         let max_extend_leaf = match rsgx_cpuidex(CPUID_MIN_EXTEND_LEAF as i32, 0) {
-            Ok(sgx_cpuinfo) => {
-                if is_valid_cpuid_extend_leaf(sgx_cpuinfo[0] as u32) {
-                    sgx_cpuinfo[0] as u32
-                } else {
-                    panic!("invalid extend cpuid_xlevel")
-                }
-            }
+            Ok(sgx_cpuinfo) => sgx_cpuinfo[0] as u32,
             _ => panic!("failed to call sgx_cpuidex"),
         };
         let cpuid = CpuId {
@@ -221,16 +213,9 @@ lazy_static! {
     static ref CPUID: CpuId = CpuId::new();
 }
 
-fn is_valid_cpuid_basic_leaf(leaf: u32) -> bool {
-    (CPUID_MIN_BASIC_LEAF..=CPUID_MAX_BASIC_LEAF).contains(&leaf)
-}
-
-fn is_valid_cpuid_extend_leaf(leaf: u32) -> bool {
-    (CPUID_MIN_EXTEND_LEAF..=CPUID_MAX_EXTEND_LEAF).contains(&leaf)
-}
-
 fn is_cpuid_leaf_has_subleaves(leaf: u32) -> bool {
-    const CPUID_LEAF_WITH_SUBLEAF: [u32; 9] = [0x4, 0x7, 0xB, 0xD, 0xF, 0x10, 0x12, 0x14, 0x17];
+    const CPUID_LEAF_WITH_SUBLEAF: [u32; 11] =
+        [0x4, 0x7, 0xB, 0xD, 0xF, 0x10, 0x12, 0x14, 0x17, 0x18, 0x1F];
     CPUID_LEAF_WITH_SUBLEAF.contains(&leaf)
 }
 
@@ -255,24 +240,17 @@ pub fn setup_cpuid_info() {
     let max_basic_leaf = CPUID.get_max_basic_leaf();
 }
 
-#[no_mangle]
-pub extern "C" fn handle_cpuid_exception(info: *mut sgx_exception_info_t) -> u32 {
-    let info = unsafe { &mut *info };
-    let ip_opcode = unsafe { *(info.cpu_context.rip as *const u16) };
-    if info.exception_vector != sgx_exception_vector_t::SGX_EXCEPTION_VECTOR_UD
-        || info.exception_type != sgx_exception_type_t::SGX_EXCEPTION_HARDWARE
-        || ip_opcode != CPUID_OPCODE
-    {
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
-    let leaf = info.cpu_context.rax as u32;
-    let subleaf = info.cpu_context.rcx as u32;
+pub fn handle_cpuid_exception(user_context: &mut CpuContext) -> Result<isize> {
+    debug!("handle CPUID exception");
+    let leaf = user_context.rax as u32;
+    let subleaf = user_context.rcx as u32;
     let cpuid_result = CPUID.get_cpuid_info(leaf, subleaf);
-    info.cpu_context.rax = cpuid_result.eax as u64;
-    info.cpu_context.rbx = cpuid_result.ebx as u64;
-    info.cpu_context.rcx = cpuid_result.ecx as u64;
-    info.cpu_context.rdx = cpuid_result.edx as u64;
-    info.cpu_context.rip += 2;
+    trace!("cpuid result: {:?}", cpuid_result);
+    user_context.rax = cpuid_result.eax as u64;
+    user_context.rbx = cpuid_result.ebx as u64;
+    user_context.rcx = cpuid_result.ecx as u64;
+    user_context.rdx = cpuid_result.edx as u64;
+    user_context.rip += 2;
 
-    EXCEPTION_CONTINUE_EXECUTION
+    Ok(0)
 }

@@ -16,7 +16,7 @@
 
 #define MIN(x, y)       ((x) <= (y) ? (x) : (y))
 
-int main(int argc, const char* argv[]) {
+int main(int argc, const char *argv[]) {
     // Create pipe
     int pipe_fds[2];
     if (pipe(pipe_fds) < 0) {
@@ -33,8 +33,8 @@ int main(int argc, const char* argv[]) {
     posix_spawn_file_actions_addclose(&file_actions, pipe_wr_fd);
 
     int child_pid;
-    if (posix_spawn(&child_pid, "dev_null", &file_actions,
-            NULL, NULL, NULL) < 0) {
+    if (posix_spawn(&child_pid, "/bin/data_sink", &file_actions,
+                    NULL, NULL, NULL) < 0) {
         printf("ERROR: failed to spawn a child process\n");
         return -1;
     }
@@ -81,7 +81,7 @@ int main(int argc, const char* argv[]) {
 
     // Calculate the throughput
     double total_s = (tv_end.tv_sec - tv_start.tv_sec)
-                   + (double)(tv_end.tv_usec - tv_start.tv_usec) / 1000000;
+                     + (double)(tv_end.tv_usec - tv_start.tv_usec) / 1000000;
     if (total_s < 1.0) {
         printf("WARNING: run long enough to get meaningful results\n");
         if (total_s == 0) { return 0; }

@@ -5,7 +5,6 @@ use process::pid_t;
 pub struct ResourceLimits {
     rlimits: [rlimit_t; RLIMIT_COUNT],
 }
-pub type ResourceLimitsRef = Arc<SgxMutex<ResourceLimits>>;
 
 impl ResourceLimits {
     pub fn get(&self, resource: resource_t) -> &rlimit_t {
@@ -19,10 +18,31 @@ impl ResourceLimits {
 
 impl Default for ResourceLimits {
     fn default() -> ResourceLimits {
-        // TODO: set appropriate limits for resources
+        // Get memory space limit from Occlum.json
+        let cfg_heap_size: u64 = config::LIBOS_CONFIG.process.default_heap_size as u64;
+        let cfg_stack_size: u64 = config::LIBOS_CONFIG.process.default_stack_size as u64;
+        let cfg_mmap_size: u64 = config::LIBOS_CONFIG.process.default_mmap_size as u64;
+
+        let stack_size = rlimit_t::new(cfg_stack_size);
+
+        // Data segment consists of three parts: initialized data, uninitialized data, and heap.
+        // Here we just approximatively consider this equal to the size of heap size.
+        let data_size = rlimit_t::new(cfg_heap_size);
+        // Address space can be approximatively considered equal to the sum of application's
+        // heap, stack and mmap size.
+        let address_space = rlimit_t::new(cfg_heap_size + cfg_stack_size + cfg_mmap_size);
+
+        // Set init open files limit to 1024 which is default value for Ubuntu
+        let open_files = rlimit_t::new(1024);
+
         let mut rlimits = ResourceLimits {
             rlimits: [Default::default(); RLIMIT_COUNT],
         };
+        *rlimits.get_mut(resource_t::RLIMIT_DATA) = data_size;
+        *rlimits.get_mut(resource_t::RLIMIT_STACK) = stack_size;
+        *rlimits.get_mut(resource_t::RLIMIT_AS) = address_space;
+        *rlimits.get_mut(resource_t::RLIMIT_NOFILE) = open_files;
+
         rlimits
     }
 }
@@ -32,6 +52,23 @@ impl Default for ResourceLimits {
 pub struct rlimit_t {
     cur: u64,
     max: u64,
+}
+
+impl rlimit_t {
+    fn new(cur: u64) -> rlimit_t {
+        rlimit_t {
+            cur: cur,
+            max: u64::max_value(),
+        }
+    }
+
+    pub fn get_cur(&self) -> u64 {
+        self.cur
+    }
+
+    pub fn get_max(&self) -> u64 {
+        self.max
+    }
 }
 
 impl Default for rlimit_t {
@@ -61,8 +98,9 @@ pub enum resource_t {
     RLIMIT_MSGQUEUE = 12,
     RLIMIT_NICE = 13,
     RLIMIT_RTPRIO = 14,
+    RLIMIT_RTTIME = 15,
 }
-const RLIMIT_COUNT: usize = 15;
+const RLIMIT_COUNT: usize = 16;
 
 impl resource_t {
     pub fn from_u32(bits: u32) -> Result<resource_t> {
@@ -82,29 +120,70 @@ impl resource_t {
             12 => Ok(resource_t::RLIMIT_MSGQUEUE),
             13 => Ok(resource_t::RLIMIT_NICE),
             14 => Ok(resource_t::RLIMIT_RTPRIO),
+            15 => Ok(resource_t::RLIMIT_RTTIME),
             _ => return_errno!(EINVAL, "invalid resource"),
         }
     }
 }
 
+/// Get or set resource limits.
+///
+/// The man page suggests that this system call works on a per-process basis
+/// and the input argument pid can only be process ID, not thread ID. This
+/// (unnecessary) restriction is lifted by our implementation. Nevertheless,
+/// since the rlimits object is shared between threads in a process, the
+/// semantic of limiting resource usage on a per-process basisi is preserved.
+///
+/// Limitation: Current implementation only takes effect on child processes.
 pub fn do_prlimit(
     pid: pid_t,
     resource: resource_t,
     new_limit: Option<&rlimit_t>,
     old_limit: Option<&mut rlimit_t>,
 ) -> Result<()> {
-    let process_ref = if pid == 0 {
-        process::get_current()
+    let process = if pid == 0 {
+        current!()
     } else {
-        process::get(pid).cause_err(|_| errno!(ESRCH, "invalid pid"))?
+        process::table::get_thread(pid).cause_err(|_| errno!(ESRCH, "invalid pid"))?
     };
-    let mut process = process_ref.lock().unwrap();
-    let rlimits_ref = process.get_rlimits();
-    let mut rlimits = rlimits_ref.lock().unwrap();
+    let mut rlimits = process.rlimits().lock().unwrap();
     if let Some(old_limit) = old_limit {
         *old_limit = *rlimits.get(resource)
     }
     if let Some(new_limit) = new_limit {
+        // Privilege is not granted for setting hard limit
+        if new_limit.get_max() != u64::max_value() {
+            return_errno!(EPERM, "setting hard limit is not permitted")
+        }
+        if new_limit.get_cur() > new_limit.get_max() {
+            return_errno!(EINVAL, "soft limit is greater than hard limit");
+        }
+
+        let mut soft_rlimit_stack_size = rlimits.get(resource_t::RLIMIT_STACK).get_cur();
+        let mut soft_rlimit_data_size = rlimits.get(resource_t::RLIMIT_DATA).get_cur();
+        let mut soft_rlimit_address_space_size = rlimits.get(resource_t::RLIMIT_AS).get_cur();
+        match resource {
+            resource_t::RLIMIT_DATA => {
+                soft_rlimit_data_size = new_limit.get_cur();
+            }
+            resource_t::RLIMIT_STACK => {
+                soft_rlimit_stack_size = new_limit.get_cur();
+            }
+            resource_t::RLIMIT_AS => {
+                soft_rlimit_address_space_size = new_limit.get_cur();
+            }
+            _ => warn!("resource type not supported"),
+        }
+
+        let soft_data_and_stack_size = soft_rlimit_data_size
+            .checked_add(soft_rlimit_stack_size)
+            .ok_or_else(|| errno!(EOVERFLOW, "memory size overflow"))?;
+
+        // Mmap space size can't be zero at least.
+        if soft_rlimit_address_space_size <= soft_data_and_stack_size {
+            return_errno!(EINVAL, "RLIMIT_AS size is too small");
+        }
+
         *rlimits.get_mut(resource) = *new_limit;
     }
     Ok(())

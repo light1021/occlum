@@ -2,6 +2,7 @@ pub use sgx_trts::libc;
 pub use sgx_trts::libc::off_t;
 pub use sgx_types::*;
 
+pub use core::intrinsics::unreachable;
 use std;
 pub use std::cell::{Cell, RefCell};
 pub use std::cmp::{max, min};
@@ -12,9 +13,22 @@ pub use std::sync::{
     Arc, SgxMutex, SgxMutexGuard, SgxRwLock, SgxRwLockReadGuard, SgxRwLockWriteGuard,
 };
 
+// Override prelude::Result with error::Result
+pub use crate::error::Result;
+pub use crate::error::*;
+pub use crate::fs::{File, FileDesc, FileRef};
+pub use crate::process::{pid_t, uid_t};
+pub use crate::util::sync::RwLock;
+
 macro_rules! debug_trace {
     () => {
-        println!("> Line = {}, File = {}", line!(), file!())
+        debug!("> Line = {}, File = {}", line!(), file!())
+    };
+}
+
+macro_rules! current {
+    () => {
+        crate::process::current::get()
     };
 }
 

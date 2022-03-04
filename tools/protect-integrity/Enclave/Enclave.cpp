@@ -10,7 +10,7 @@
 
 #define PRINTF_BUFSIZE          512
 
-static int printf(const char* fmt, ...) {
+static int printf(const char *fmt, ...) {
     char buf[PRINTF_BUFSIZE] = {0};
     va_list args;
     va_start(args, fmt);
@@ -20,7 +20,7 @@ static int printf(const char* fmt, ...) {
     return 0;
 }
 
-static int eprintf(const char* fmt, ...) {
+static int eprintf(const char *fmt, ...) {
     char buf[PRINTF_BUFSIZE] = {0};
     va_list args;
     va_start(args, fmt);
@@ -30,29 +30,34 @@ static int eprintf(const char* fmt, ...) {
     return 0;
 }
 
-static void print_mac(sgx_aes_gcm_128bit_tag_t* mac) {
-    unsigned char* bytes = (unsigned char*) mac;
+static void print_mac(sgx_aes_gcm_128bit_tag_t *mac) {
+    unsigned char *bytes = (unsigned char *) mac;
     for (size_t bi = 0; bi < sizeof(*mac); bi++) {
-        if (bi != 0) printf("-");
+        if (bi != 0) { printf("-"); }
         printf("%02x", bytes[bi] & 0xFF);
     }
     printf("\n");
 }
 
-
-static int open(const char* path) {
+static int open_for_write(const char *path) {
     int fd = 0;
-    ocall_open(&fd, path);
+    ocall_open_for_write(&fd, path);
     return fd;
 }
 
-static ssize_t read(int fd, void* buf, size_t size) {
+static int open_for_read(const char *path) {
+    int fd = 0;
+    ocall_open_for_read(&fd, path);
+    return fd;
+}
+
+static ssize_t read(int fd, void *buf, size_t size) {
     ssize_t ret = 0;
     ocall_read(&ret, fd, buf, size);
     return ret;
 }
 
-static ssize_t write(int fd, const void* buf, size_t size) {
+static ssize_t write(int fd, const void *buf, size_t size) {
     ssize_t ret = 0;
     ocall_write(&ret, fd, buf, size);
     return ret;
@@ -68,13 +73,13 @@ static int close(int fd) {
 //  ECalls
 // ==========================================================================
 
-int ecall_protect(const char* input_path, const char* output_path) {
+int ecall_protect(const char *input_path, const char *output_path) {
     int input_file = -1;
-    SGX_FILE* output_file = NULL;
+    SGX_FILE *output_file = NULL;
     size_t len;
     char buf[4 * 1024];
 
-    input_file = open(input_path);
+    input_file = open_for_read(input_path);
     if (input_file < 0) {
         eprintf("Error: cannot open the input file at %s\n", input_path);
         goto on_error;
@@ -107,9 +112,10 @@ on_error:
     return -1;
 }
 
-int ecall_show(const char* protected_file_path) {
-    SGX_FILE* protected_file = NULL;
+int ecall_show(const char *protected_file_path, const char *show_path) {
+    SGX_FILE *protected_file = NULL;
     ssize_t len;
+    int output_fd = 1; /* stdout */
     char buf[4 * 1024];
 
     protected_file = sgx_fopen_integrity_only(protected_file_path, "r");
@@ -117,9 +123,16 @@ int ecall_show(const char* protected_file_path) {
         eprintf("Error: failed to open the given protected file %s\n", protected_file_path);
         goto on_error;
     }
+    if (show_path) {
+        output_fd = open_for_write(show_path);
+        if (output_fd < 0) {
+            eprintf("Error: failed to open the given show_path %s\n", show_path);
+            goto on_error;
+        }
+    }
 
     while ((len = sgx_fread(buf, 1, sizeof(buf), protected_file)) > 0) {
-        write(1/* stdout */, buf, len);
+        write(output_fd, buf, len);
     }
 
     if (sgx_ferror(protected_file)) {
@@ -128,16 +141,22 @@ int ecall_show(const char* protected_file_path) {
     }
 
     sgx_fclose(protected_file);
+    if (output_fd > 1) {
+        close(output_fd);
+    }
     return 0;
 on_error:
     if (protected_file != NULL) {
         sgx_fclose(protected_file);
     }
+    if (output_fd > 1) {
+        close(output_fd);
+    }
     return -1;
 }
 
-int ecall_show_mac(const char* protected_file_path) {
-    SGX_FILE* protected_file = NULL;
+int ecall_show_mac(const char *protected_file_path) {
+    SGX_FILE *protected_file = NULL;
     sgx_aes_gcm_128bit_tag_t mac = { 0 };
 
     protected_file = sgx_fopen_integrity_only(protected_file_path, "r");
